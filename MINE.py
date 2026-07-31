@@ -13,7 +13,7 @@ AI_API_KEY = os.getenv('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
 
 # التأكد من وجود المفاتيح المطلوبة
 if not DISCORD_TOKEN or not AI_API_KEY:
-    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و AI_API_KEY في ملف .env")
+    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و AI_API_KEY في متغيرات البيئة!")
     exit(1)
 
 # إعداد الصلاحيات للـ Bot
