@@ -9,11 +9,12 @@ from dotenv import load_dotenv
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-AI_API_KEY = os.getenv('AI_API_KEY')
+# يفحص كلاً من AI_API_KEY و GROQ_API_KEY لضمان المرونة
+AI_API_KEY = os.getenv('AI_API_KEY') or os.getenv('GROQ_API_KEY')
 
 # التأكد من وجود المفاتيح المطلوبة
 if not DISCORD_TOKEN or not AI_API_KEY:
-    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و AI_API_KEY في متغيرات البيئة!")
+    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و AI_API_KEY (أو GROQ_API_KEY) في متغيرات البيئة!")
     exit(1)
 
 # إعداد الصلاحيات للـ Bot
@@ -59,7 +60,8 @@ async def ask_ena_brain(prompt, user_name):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"[{user_name} يقول]: {prompt}"}
         ],
-        "temperature": 0.7
+        "temperature": 0.6,   # الدرجة المثالية لمنع أخطاء التنسيق في DeepSeek R1
+        "max_tokens": 2048    # ضروري جداً لإعطاء مساحة للتفكير + الإجابة
     }
     
     try:
@@ -107,18 +109,18 @@ async def on_message(message):
         async with message.channel.typing():
             raw_response = await ask_ena_brain(clean_prompt, user_name)
             
-            # فصل العقل الباطن <think> عن الرد النهائي
+            # طباعة العقل الباطن <think> في السجلات (Logs) للتحليل
             think_match = re.search(r'<think>(.*?)</think>', raw_response, re.DOTALL)
             if think_match:
                 subconscious = think_match.group(1).strip()
-                final_reply = raw_response.replace(think_match.group(0), '').strip()
                 print(f"🧠 [العقل الباطن لـ ENA - تفكير داخلي]:\n{subconscious}")
-            else:
-                final_reply = raw_response.strip()
 
-            # التأكد من أن الرد ليس فارغاً
+            # إزالة مسودة التفكير الداخلي لتنظيف الرد قبل إرساله للديسكورد
+            final_reply = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+            
+            # إذا كانت الإجابة فارغة بعد القص، يتم الاعتماد على النص الخام
             if not final_reply:
-                final_reply = "..."
+                final_reply = raw_response.strip() if raw_response.strip() else "..."
 
             # معالجة حد الـ 2000 حرف في ديسكورد (تقسيم الرسالة إن كانت طويلة)
             if len(final_reply) > 2000:
@@ -135,7 +137,7 @@ async def main():
     try:
         await client.start(DISCORD_TOKEN)
     except discord.errors.LoginFailure:
-        print("❌ خطأ: التوكن (DISCORD_TOKEN) غير صحيح أو انتهت صلاحيته! يرجى التأكد منه من Discord Developer Portal وضبطه في Render.")
+        print("❌ خطأ: التوكن (DISCORD_TOKEN) غير صحيح أو انتهت صلاحيته!")
     except discord.errors.PrivilegedIntentsRequired:
         print("❌ خطأ: صلاحيات Intents غير مفعلة! اذهب إلى Discord Developer Portal -> Bot وفعّل Message Content Intent.")
     except Exception as e:
