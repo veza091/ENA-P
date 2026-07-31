@@ -131,9 +131,15 @@ async def on_message(message):
 # 4. نقطة الانطلاق والتشغيل الرئيسي
 # ==========================================
 async def main():
-    # تشغيل خادم الويب ثم تشغيل البوت
     await start_web_server()
-    await client.start(DISCORD_TOKEN)
+    try:
+        await client.start(DISCORD_TOKEN)
+    except discord.errors.LoginFailure:
+        print("❌ خطأ: التوكن (DISCORD_TOKEN) غير صحيح أو انتهت صلاحيته! يرجى التأكد منه من Discord Developer Portal وضبطه في Render.")
+    except discord.errors.PrivilegedIntentsRequired:
+        print("❌ خطأ: صلاحيات Intents غير مفعلة! اذهب إلى Discord Developer Portal -> Bot وفعّل Message Content Intent.")
+    except Exception as e:
+        print(f"❌ حدث خطأ أثناء الاتصال بديسكورد: {e}")
 
 if __name__ == "__main__":
     try:
