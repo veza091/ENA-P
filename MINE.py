@@ -55,13 +55,13 @@ async def ask_ena_brain(prompt, user_name):
     )
     
     payload = {
-       "model": "llama-3.3-70b-versatile",
+        "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"[{user_name} يقول]: {prompt}"}
         ],
-        "temperature": 0.6,   # الدرجة المثالية لمنع أخطاء التنسيق في DeepSeek R1
-        "max_tokens": 2048    # ضروري جداً لإعطاء مساحة للتفكير + الإجابة
+        "temperature": 0.7,
+        "max_tokens": 2048
     }
     
     try:
@@ -107,20 +107,10 @@ async def on_message(message):
         
         # إظهار أن البوت يكتب الآن (Typing status)
         async with message.channel.typing():
-            raw_response = await ask_ena_brain(clean_prompt, user_name)
+            final_reply = await ask_ena_brain(clean_prompt, user_name)
             
-            # طباعة العقل الباطن <think> في السجلات (Logs) للتحليل
-            think_match = re.search(r'<think>(.*?)</think>', raw_response, re.DOTALL)
-            if think_match:
-                subconscious = think_match.group(1).strip()
-                print(f"🧠 [العقل الباطن لـ ENA - تفكير داخلي]:\n{subconscious}")
-
-            # إزالة مسودة التفكير الداخلي لتنظيف الرد قبل إرساله للديسكورد
-            final_reply = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
-            
-            # إذا كانت الإجابة فارغة بعد القص، يتم الاعتماد على النص الخام
             if not final_reply:
-                final_reply = raw_response.strip() if raw_response.strip() else "..."
+                final_reply = "..."
 
             # معالجة حد الـ 2000 حرف في ديسكورد (تقسيم الرسالة إن كانت طويلة)
             if len(final_reply) > 2000:
