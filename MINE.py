@@ -55,7 +55,7 @@ async def ask_ena_brain(prompt, user_name):
     )
     
     payload = {
-        "model": "deepseek-r1-distill-llama-70b",
+       "model": "llama-3.3-70b-versatile",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"[{user_name} يقول]: {prompt}"}
