@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
-DISCORD_TOKEN = os.getenv('MTUzMjA3MTY5ODQxMTY4ODAxNg.Gpzx6g.GI46V2Qux86vJ_ZGFym9kZ8UEUE3fUrKPS7-EY')
-AI_API_KEY = os.getenv('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')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+AI_API_KEY = os.getenv('AI_API_KEY')
 
 # التأكد من وجود المفاتيح المطلوبة
 if not DISCORD_TOKEN or not AI_API_KEY:
