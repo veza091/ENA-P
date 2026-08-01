@@ -16,25 +16,19 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
     print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و GEMINI_API_KEY في متغيرات البيئة!")
     exit(1)
 
-# إعداد مفتاح Gemini رسمياً
+# إعداد مفتاح Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 
-# إعداد نموذج Gemini 1.5 Flash مع التعليمات الأساسية لشخصية ENA
+# إعداد النموذج باستخدام الصيغة الصحيحة تماماً المعتمدة حالياً
 generation_config = {
     "temperature": 0.7,
     "max_output_tokens": 2048,
 }
 
-system_instruction = (
-    "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
-    "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد."
-)
-
+# دمج التعليمات مع النموذج لتجنب أي أخطاء في الـ system instructions القديمة
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash-latest",
-    generation_config=generation_config,
-    system_instruction=system_instruction
-)
+    model_name="gemini-1.5-flash",
+    generation_config=generation_config
 )
 
 # إعداد الصلاحيات للـ Bot
@@ -59,13 +53,19 @@ async def start_web_server():
     print(f"🌐 خادم الويب يعمل بنجاح على المنفذ (Port): {port}")
 
 # ==========================================
-# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini SDK)
+# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
     try:
-    # استخدام التعديل غير المتزامن أو تشغيله عبر executor لتجنب تعليق البوت
-        full_prompt = f"[{user_name} يقول]: {prompt}"
+        # إرسال الشخصية والسياق مباشرة داخل نص الطلب لضمان عملها 100% بدون أخطاء 404
+        full_prompt = (
+            "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
+            "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد.\n\n"
+            f"[{user_name} يقول]: {prompt}"
+        )
+        
         response = await asyncio.to_thread(model.generate_content, full_prompt)
+        
         if response and response.text:
             return response.text
         else:
