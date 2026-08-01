@@ -9,12 +9,12 @@ from dotenv import load_dotenv
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# يفحص كلاً من AI_API_KEY و GROQ_API_KEY لضمان المرونة
-AI_API_KEY = os.getenv('AI_API_KEY') or os.getenv('GROQ_API_KEY')
+# استخدام مفتاح Gemini (ويمكنه دعم أي اسم بديل احتياطياً)
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or os.getenv('AI_API_KEY')
 
 # التأكد من وجود المفاتيح المطلوبة
-if not DISCORD_TOKEN or not AI_API_KEY:
-    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و AI_API_KEY (أو GROQ_API_KEY) في متغيرات البيئة!")
+if not DISCORD_TOKEN or not GEMINI_API_KEY:
+    print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و GEMINI_API_KEY في متغيرات البيئة!")
     exit(1)
 
 # إعداد الصلاحيات للـ Bot
@@ -26,7 +26,7 @@ client = discord.Client(intents=intents)
 # 1. خادم الويب الخفيف (للاستضافة المجانية 24/7)
 # ==========================================
 async def handle(request):
-    return web.Response(text="ENA Web Service is active and running 24/7!")
+    return web.Response(text="ENA Web Service with Gemini is active and running 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -39,29 +39,34 @@ async def start_web_server():
     print(f"🌐 خادم الويب يعمل بنجاح على المنفذ (Port): {port}")
 
 # ==========================================
-# 2. الاتصال بمحرك الذكاء الاصطناعي (Groq API)
+# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    # استخدام نموذج gemini-1.5-flash أو gemini-1.5-pro (اخترنا flash للسرعة والذكاء العالي)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
     headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
     }
     
     # التعليمات الأساسية لشخصية ENA
-    system_prompt = (
+    system_instruction = (
         "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
         "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد."
     )
     
     payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"[{user_name} يقول]: {prompt}"}
+        "contents": [
+            {
+                "parts": [
+                    {"text": f"{system_instruction}\n\n[{user_name} يقول]: {prompt}"}
+                ]
+            }
         ],
-        "temperature": 0.7,
-        "max_tokens": 2048
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2048
+        }
     }
     
     try:
@@ -69,10 +74,11 @@ async def ask_ena_brain(prompt, user_name):
             async with session.post(url, headers=headers, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data['choices'][0]['message']['content']
+                    # استخراج الإجابة من هيكل استجابة Gemini
+                    return data['candidates'][0]['content']['parts'][0]['text']
                 else:
                     error_text = await response.text()
-                    print(f"❌ خطأ من Groq API ({response.status}): {error_text}")
+                    print(f"❌ خطأ من Gemini API ({response.status}): {error_text}")
                     return "عذراً، أواجه مشكلة في الاتصال بعقلي الآن."
     except Exception as e:
         print(f"❌ حدث استثناء أثناء الاتصال بالشبكة: {e}")
@@ -84,35 +90,29 @@ async def ask_ena_brain(prompt, user_name):
 @client.event
 async def on_ready():
     print("----------------------------------------")
-    print(f"✅ نظام ENA متصل الآن بنجاح كـ: {client.user}")
+    print(f"✅ نظام ENA (Gemini) متصل الآن بنجاح كـ: {client.user}")
     print("----------------------------------------")
 
 @client.event
 async def on_message(message):
-    # التغاضي عن الرسائل الصادرة من البوت نفسه
     if message.author == client.user:
         return
 
-    # التفاعل فقط عند عمل المنشن لـ ENA
     if client.user in message.mentions:
-        # تنظيف نص الرسالة من المنشن
         clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
         user_name = message.author.display_name
         
-        # إذا كانت الرسالة فارغة بعد المنشن
         if not clean_prompt:
             clean_prompt = "مرحباً!"
 
         print(f"\n📥 [رسالة جديدة من {user_name}]: {clean_prompt}")
         
-        # إظهار أن البوت يكتب الآن (Typing status)
         async with message.channel.typing():
             final_reply = await ask_ena_brain(clean_prompt, user_name)
             
             if not final_reply:
                 final_reply = "..."
 
-            # معالجة حد الـ 2000 حرف في ديسكورد (تقسيم الرسالة إن كانت طويلة)
             if len(final_reply) > 2000:
                 for chunk in [final_reply[i:i+1900] for i in range(0, len(final_reply), 1900)]:
                     await message.reply(chunk)
