@@ -2,9 +2,9 @@ import os
 import re
 import asyncio
 import discord
-import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
@@ -15,6 +15,26 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or os.getenv('AI_API_KEY')
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     print("❌ خطأ: يرجى التأكد من ضبط DISCORD_TOKEN و GEMINI_API_KEY في متغيرات البيئة!")
     exit(1)
+
+# إعداد مفتاح Gemini رسمياً
+genai.configure(api_key=GEMINI_API_KEY)
+
+# إعداد نموذج Gemini 1.5 Flash مع التعليمات الأساسية لشخصية ENA
+generation_config = {
+    "temperature": 0.7,
+    "max_output_tokens": 2048,
+}
+
+system_instruction = (
+    "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
+    "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد."
+)
+
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    generation_config=generation_config,
+    system_instruction=system_instruction
+)
 
 # إعداد الصلاحيات للـ Bot
 intents = discord.Intents.default()
@@ -38,49 +58,20 @@ async def start_web_server():
     print(f"🌐 خادم الويب يعمل بنجاح على المنفذ (Port): {port}")
 
 # ==========================================
-# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini API الصحيح)
+# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini SDK)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    # الرابط الصحيح والمخصص لنموذج gemini-1.5-flash
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    
-    headers = {
-        "x-goog-api-key": GEMINI_API_KEY,
-        "Content-Type": "application/json"
-    }
-    
-    system_instruction = (
-        "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
-        "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد."
-    )
-    
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": f"{system_instruction}\n\n[{user_name} يقول]: {prompt}"}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 2048
-        }
-    }
-    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data['candidates'][0]['content']['parts'][0]['text']
-                else:
-                    error_text = await response.text()
-                    print(f"❌ خطأ من Gemini API ({response.status}): {error_text}")
-                    return "عذراً، أواجه مشكلة في الاتصال بعقلي الآن."
+    # استخدام التعديل غير المتزامن أو تشغيله عبر executor لتجنب تعليق البوت
+        full_prompt = f"[{user_name} يقول]: {prompt}"
+        response = await asyncio.to_thread(model.generate_content, full_prompt)
+        if response and response.text:
+            return response.text
+        else:
+            return "عذراً، لم أتمكن من صياغة إجابة."
     except Exception as e:
-        print(f"❌ حدث استثناء أثناء الاتصال بالشبكة: {e}")
-        return "عذراً، حدث خطأ غير متوقع في الاتصال."
+        print(f"❌ خطأ من Gemini API: {e}")
+        return "عذراً، أواجه مشكلة في الاتصال بعقلي الآن."
 
 # ==========================================
 # 3. أحداث ديسكورد (Discord Events)
@@ -88,7 +79,7 @@ async def ask_ena_brain(prompt, user_name):
 @client.event
 async def on_ready():
     print("----------------------------------------")
-    print(f"✅ نظام ENA (Gemini) متصل الآن بنجاح كـ: {client.user}")
+    print(f"✅ نظام ENA (Gemini SDK) متصل الآن بنجاح كـ: {client.user}")
     print("----------------------------------------")
 
 @client.event
