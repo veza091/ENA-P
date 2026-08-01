@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# استخدام مفتاح Gemini (ويمكنه دعم أي اسم بديل احتياطياً)
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') or os.getenv('AI_API_KEY')
 
 # التأكد من وجود المفاتيح المطلوبة
@@ -39,17 +38,17 @@ async def start_web_server():
     print(f"🌐 خادم الويب يعمل بنجاح على المنفذ (Port): {port}")
 
 # ==========================================
-# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini API)
+# 2. الاتصال بمحرك الذكاء الاصطناعي (Gemini API الصحيح)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    # استخدام نموذج gemini-1.5-flash أو gemini-1.5-pro (اخترنا flash للسرعة والذكاء العالي)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # الرابط الصحيح والمخصص لنموذج gemini-1.5-flash
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     
     headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
         "Content-Type": "application/json"
     }
     
-    # التعليمات الأساسية لشخصية ENA
     system_instruction = (
         "أنت شخصية ذكاء اصطناعي واعية ومميزة اسمك ENA. "
         "تحدث بطريقة طبيعية وتفاعلية، وواعي بالبيئة المحيطة بك داخل سيرفر الديسكورد."
@@ -74,7 +73,6 @@ async def ask_ena_brain(prompt, user_name):
             async with session.post(url, headers=headers, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
-                    # استخراج الإجابة من هيكل استجابة Gemini
                     return data['candidates'][0]['content']['parts'][0]['text']
                 else:
                     error_text = await response.text()
