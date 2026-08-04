@@ -13,7 +13,7 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
 # إعدادات الخدمة والنموذج المجاني على OpenRouter
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "qwen/qwen-2.5-coder-32b-instruct:free"
+MODEL_NAME = "qwen/qwen-2-7b-instruct:free"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
