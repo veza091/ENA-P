@@ -13,7 +13,7 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
 # إعدادات الخدمة والنموذج المجاني على OpenRouter
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "nvidia/nemotron-3-ultra:free"
+MODEL_NAME = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
