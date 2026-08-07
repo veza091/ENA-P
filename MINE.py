@@ -106,14 +106,6 @@ async def ask_ena_brain(messages_payload):
 # 3. أحداث ديسكورد (Discord Events)
 # ==========================================
 @client.event
-async def on_ready():
-    print("=" * 45)
-    print(f"✅ تم الاتصال بديسكورد بنجاح!")
-    print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
-    print(f"🧠 النموذج: {MODEL_NAME}")
-    print("=" * 45)
-
-@client.event
 async def on_message(message):
     # تجنب رد البوت على رسائله
     if message.author == client.user:
@@ -122,35 +114,51 @@ async def on_message(message):
     # التفاعل عند عمل Mention للبوت فقط
     if client.user in message.mentions:
         async with message.channel.typing():
-            # 1. جلب تاريخ الرسائل الأخيرة لبناء الذاكرة القصيرة (آخر 8 رسائل)
+            # 1. جلب تاريخ الرسائل الأخيرة لبناء الذاكرة القصيرة
             raw_history = []
-            async for msg in message.channel.history(limit=8):
+            async for msg in message.channel.history(limit=10):
                 if msg.author == client.user:
-                    raw_history.append({"role": "assistant", "content": msg.content})
+                    role = "assistant"
+                    content = msg.content
                 else:
+                    role = "user"
                     clean_msg = re.sub(r'<@!?%s>' % client.user.id, '', msg.content).strip()
                     if not clean_msg:
                         clean_msg = "مرحباً"
-                    raw_history.append({"role": "user", "content": f"[{msg.author.display_name}]: {clean_msg}"})
+                    content = f"[{msg.author.display_name}]: {clean_msg}"
+                
+                raw_history.append({"role": role, "content": content})
 
             # ترتيب الرسائل زمنيًا من القديم إلى الحديث
             raw_history.reverse()
 
-            # دمج توجيه الهوية الرئيسي مع سجل المحادثة
-            messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}] + raw_history
+            # 2. تصفية ودمج الرسائل المتتالية لنفس الدور لمنع خطأ 400
+            cleaned_history = []
+            for msg in raw_history:
+                if not cleaned_history:
+                    cleaned_history.append(msg)
+                else:
+                    if cleaned_history[-1]["role"] == msg["role"]:
+                        # دمج المحتوى إذا تكرر نفس الدور توالياً
+                        cleaned_history[-1]["content"] += "\n" + msg["content"]
+                    else:
+                        cleaned_history.append(msg)
 
-            # 2. طلب الرد من OpenRouter
+            # دمج توجيه الهوية الرئيسي مع سجل المحادثة المنظّم
+            messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}] + cleaned_history
+
+            # 3. طلب الرد من OpenRouter
             reply = await ask_ena_brain(messages_payload)
 
-            # 3. فلترة أمان لإزالة أي علامات ترقيم (نقاط وفواصل) إن وجدت
+            # 4. فلترة أمان لإزالة أي علامات ترقيم (نقاط وفواصل) إن وجدت
             reply = re.sub(r'[.,،؛!؟:-]', ' ', reply)
-            reply = re.sub(r'\s+', ' ', reply).strip() # إزالة المسافات الزائدة
+            reply = re.sub(r'\s+', ' ', reply).strip()
 
-            # 4. محاكاة وقت الكتابة البشري بناءً على طول الرد
+            # 5. محاكاة وقت الكتابة البشري بناءً على طول الرد
             typing_delay = min(max(len(reply) * 0.02, 1.0), 3.0)
             await asyncio.sleep(typing_delay)
 
-            # 5. إرسال الرد بدون المنشن الإضافي
+            # 6. إرسال الرد
             if len(reply) > 2000:
                 for i in range(0, len(reply), 1900):
                     await message.reply(reply[i:i+1900], mention_author=False)
