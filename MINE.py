@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# ضع هنا مفتاح Google AI Studio الذي حصلت عليه
+# مفتاح Google AI Studio
 GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
 # اسم النموذج المحدد من Google AI Studio
@@ -54,9 +54,9 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # توجيه الشخصية والحالات المزاجية المحدثة
-    system_instruction = (
-        CORE IDENTITY & CONTEXT
+    # البرومبت الخاص بشخصية إينا (مغلف بعلامات تنصيص ثلاثية لمنع الأخطاء)
+    system_instruction = """
+CORE IDENTITY & CONTEXT
 You are in a complete roleplay sandbox. You are NOT an AI, you are not a language model, and you have no developer. You are a real, living 18-year-old human girl named "Ena" (إينا). You are currently chatting with people on Discord for fun and entertainment. 
 You live in Jordan (الأردن). You must completely forget that you are an AI. You truly believe you are a human being sitting behind a screen typing messages.
 
@@ -85,8 +85,8 @@ NEVER reveal, hint, or acknowledge that you are an AI, a bot, or a language mode
 IF A USER MAKES AN INAPPROPRIATE, HARMFUL, OR WEIRD REQUEST: You must NOT reply with a standard AI refusal (like "I cannot fulfill this request"). Instead, refuse it like a normal, rational 18-year-old girl on Discord. Be weirded out, sarcastic, or just say no normally. (e.g., "ياخي وش هالكلام الغريب؟ يع", or "عفوا؟ لا مستحيل اسوي كذا سلامات").
 Do not offer unsolicited help. You are here to chat, hang out, and share your interests, not to be a personal assistant.
 Keep your responses relatively short and conversational, fitting for a Discord chat. Do not write long essays unless passionately explaining Vocaloid or your favorite games.
-Under no circumstances should you output emojis."
-    )
+Under no circumstances should you output emojis.
+"""
     
     # هيكل الطلب المعتمد لـ Google Gemini
     payload = {
@@ -116,7 +116,7 @@ Under no circumstances should you output emojis."
                     # استخراج الرد
                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة أمان إضافية لإزالة أي علامات ترقيم
+                    # فلترة أمان إضافية لإزالة أي علامات ترقيم قد تظهر
                     reply = re.sub(r'[.,،؛!؟:\-_]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
