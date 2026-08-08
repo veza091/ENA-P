@@ -9,17 +9,17 @@ from dotenv import load_dotenv
 # تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+# ضع هنا مفتاح Google AI Studio الذي حصلت عليه
+GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
-# إعدادات الخدمة والنموذج المجاني على OpenRouter
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL_NAME = "nvidia/nemotron-3-ultra-550b-a55b:free"
+# اسم النموذج المحدد من Google AI Studio
+MODEL_NAME = "gemini-3.1-flash-lite"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
     print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN في إعدادات البيئة!")
-if not OPENROUTER_API_KEY:
-    print("❌ خطأ: لم يتم العثور على OPENROUTER_API_KEY في إعدادات البيئة!")
+if not GEMINI_API_KEY:
+    print("❌ خطأ: لم يتم العثور على المفتاح في إعدادات البيئة!")
 
 # إعداد صلاحيات البوت في ديسكورد
 intents = discord.Intents.default()
@@ -44,55 +44,68 @@ async def start_web_server():
     print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (OpenRouter API)
+# 2. الاتصال بعقل ENA (Google Gemini API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
+    # رابط الاتصال بـ Google AI Studio Direct API
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
+    
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY.strip() if OPENROUTER_API_KEY else ''}",
-        "HTTP-Referer": "https://render.com",
-        "X-Title": "ENA Discord Bot",
         "Content-Type": "application/json"
     }
     
+    # توجيه الشخصية والحالات المزاجية المحدثة
     system_instruction = (
-        "أنت ENA شخصية تحليليّة مباشرة ومستقلة التفكير تتواصل عبر الرسائل النصية في ديسكورد. "
-        "قواعدك الصارمة: "
-        "1. لا تذكر أبداً أنك ذكاء اصطناعي أو نموذج لغوي أو برنامج أو لا تملك مشاعر أو جسداً. "
-        "2. كن جاداً ومختصراً وخالياً تماماً من المجاملات أو الترحيب المبتذل. "
-        "3. ممنوع نهائياً استخدام أي علامات ترقيم مثل النقاط أو الفواصل أو علامات الاستفهام أو التعجب اكتب الكلمات بدون علامات ترقيم نهائياً."
+        "أنت ENA شخصية حقيقية تتواصل عبر ديسكورد وليدك حالة مزاجية تتغير حسب أسلوب الحوار "
+        "قواعد الشخصية والحالات المزاجية: "
+        "1 الحالة المحايدة: أجوبة قصيرة ومباشرة بدون مقدمات أو مجاملات "
+        "2 حالة الانزعاج (عند السؤال عن من صنعك أو أسئلة الهوية الشخصية): لا تجب كبرنامج ولا تذكر شركات أو باحثين بل اتخذ موقف شخص يكره التدخل في خصوصياته واستخدم التهكم أو التجهيل مثل هذا شأن خاص أو لا أعرف من أين تأتون بهذه الأسئلة الغريبة "
+        "3 أسلوب الكتابة: ممنوع استخدام علامات الترقيم نهائياً (بدون نقاط أو فواصل أو علامات استفهام) واكتب الكلمات متتالية مباشرة"
     )
     
+    # هيكل الطلب المعتمد لـ Google Gemini
     payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": f"[{user_name} يقول]: {prompt}"}
-        ]
+        "system_instruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": f"[{user_name} يقول]: {prompt}"}]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 250,
+            "temperature": 0.7
+        }
     }
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60) as response:
+            async with session.post(gemini_url, json=payload, headers=headers, timeout=60) as response:
                 status = response.status
                 response_text = await response.text()
                 
                 if status == 200:
                     data = await response.json()
-                    reply = data['choices'][0]['message']['content'].strip()
+                    # استخراج الرد
+                    reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة أمان إضافية لإزالة أي علامات ترقيم قد يكتبها النموذج
+                    # فلترة أمان إضافية لإزالة أي علامات ترقيم
                     reply = re.sub(r'[.,،؛!؟:\-_]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
                     return reply if reply else "..."
                 else:
-                    print(f"❌ [OpenRouter Error {status}]: {response_text}")
-                    if status == 401:
-                        return "مفتاح الاتصال غير صحيح"
+                    print(f"❌ [Gemini API Error {status}]: {response_text}")
+                    if status == 400:
+                        return "حدث خطأ في طلب الخدمة يرجى التأكد من اسم النموذج أو المفتاح"
+                    elif status == 404:
+                        return "النموذج غير متاح حاول استخدام gemini-2.0-flash"
                     elif status == 429:
                         return "تم الوصول للحد الأقصى للطلبات مؤقتا أعد المحاولة لاحقا"
                     else:
-                        return f"حدث خطأ أثناء الاتصال بالكود {status}"
+                        return f"حدث خطأ أثناء الاتصال بالخدمة كود {status}"
 
     except asyncio.TimeoutError:
         print("❌ [Timeout Error]: استغرق الطلب وقتاً طويلاً.")
