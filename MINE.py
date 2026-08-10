@@ -24,7 +24,7 @@ MODEL_CHAIN = [
     "gemma-4-26b-it"
 ]
 
-MAX_HISTORY_LENGTH = 10  # عدد الرسائل المحفوظة لكل مستخدم في السحاب
+MAX_SHORT_TERM = 8  # عدد الرسائل في الذاكرة قصيرة الأمد قبل التلخيص الإحلالي
 
 if not DISCORD_TOKEN:
     print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN")
@@ -36,65 +36,102 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 # ==========================================
-# 1. إدارة الذاكرة السحابية (Cloud Database via Upstash)
+# 1. إدارة الذاكرة السحابية (Upstash REST API)
 # ==========================================
-async def get_cloud_history(user_id):
-    """جلب سجل المحادثة مباشرة من قاعدة البيانات السحابية"""
+async def get_redis_data(key):
+    """جلب البيانات مباشرة من Upstash"""
     if not REDIS_URL or not REDIS_TOKEN:
-        return []
-    
-    url = f"{REDIS_URL}/get/ena_user_{user_id}"
+        return None
+    url = f"{REDIS_URL}/get/{key}"
     headers = {"Authorization": f"Bearer {REDIS_TOKEN}"}
-    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    result = data.get("result")
-                    if result:
-                        return json.loads(result)
+                    res = data.get("result")
+                    return json.loads(res) if res else None
     except Exception as e:
         print(f"⚠️ [Cloud DB Read Error]: {e}")
-    return []
+    return None
 
-async def save_cloud_history(user_id, role, text):
-    """تحديث وحفظ ذاكرة المستخدم في قاعدة البيانات السحابية"""
+async def set_redis_data(key, data_value):
+    """حفظ أو تحديث البيانات في Upstash"""
     if not REDIS_URL or not REDIS_TOKEN:
         return
-    
-    history = await get_cloud_history(user_id)
-    history.append({"role": role, "text": text})
-    
-    # الإبقاء على آخر N رسائل
-    if len(history) > MAX_HISTORY_LENGTH:
-        history = history[-MAX_HISTORY_LENGTH:]
-        
-    url = f"{REDIS_URL}/set/ena_user_{user_id}"
+    url = f"{REDIS_URL}/set/{key}"
     headers = {
         "Authorization": f"Bearer {REDIS_TOKEN}",
         "Content-Type": "application/json"
     }
-    
     try:
         async with aiohttp.ClientSession() as session:
-            await session.post(url, headers=headers, data=json.dumps(json.dumps(history, ensure_ascii=False)), timeout=10)
+            await session.post(url, headers=headers, data=json.dumps(json.dumps(data_value, ensure_ascii=False)), timeout=10)
     except Exception as e:
         print(f"⚠️ [Cloud DB Save Error]: {e}")
 
-def format_history_for_prompt(history_list):
-    """صياغة ذاكرة المحادثة السابقة لتغذية النموذج بها"""
-    formatted_context = ""
-    for msg in history_list:
-        role_label = "المستخدم" if msg["role"] == "user" else "إينا"
-        formatted_context += f"{role_label}: {msg['text']}\n"
-    return formatted_context
+# ==========================================
+# 2. إدارة الذاكرة البشرية الديناميكية (إحلال وتعديل)
+# ==========================================
+async def summarize_and_compress(user_id, short_history, current_profile):
+    """تحديث الذاكرة طويلة الأمد ديناميكياً بحذف الهامشي وتعديل التغيرات"""
+    formatted_chat = ""
+    for msg in short_history:
+        role = "المستخدم" if msg["role"] == "user" else "إينا"
+        formatted_chat += f"{role}: {msg['text']}\n"
+
+    prompt_summary = f"""أنت مدير الذاكرة السحابية. وظيفتك تحديث الملف الشخصي للمستخدم بناءً على الحوار الجديد بشكل ديناميكي مثل عقل الإنسان.
+
+[الملف الشخصي الحالي للمستخدم]:
+{current_profile if current_profile else 'لا توجد معلومات قائمة بعد'}
+
+[الحوار الأخير]:
+{formatted_chat}
+
+قم بإعادة كتابة وتحديث الملف الشخصي للمستخدم طبقاً للقواعد التالية:
+1. التحديث والتعديل: إذا تغيرت آرائه أو تفضيلاته (مثل: غير ألعابه المفضلة أو اهتماماته)، قم بتعديل المعلومة القديمة بالجديدة فوراً.
+2. تصفية الهامشي: احذف التفاصيل المؤقتة واليومية (مثل: صاحي متاخر، لعبت جيم واحد، أكلت شيء).
+3. التركيز على الأهم: احتفظ فقط بالمعلومات الأساسية (اسمه، طبيعة شخصيته، اهتماماته الأساسية، أسلوب كلامه، التفضيلات الدائمة).
+4. الإيجاز الشديد: اكتب الملف الشخصي المحدث في أسطر قصيرة وموجزة جداً بدون علامات ترقيم وبدون مقدمات."""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt_summary}]}],
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.2}
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=20) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    new_profile = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    new_profile = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', new_profile)
+                    new_profile = re.sub(r'\s+', ' ', new_profile).strip()
+                    
+                    await set_redis_data(f"ena_profile_{user_id}", new_profile)
+                    print(f"🧠 [تحديث الذاكرة طويلة الأمد للمستخدم {user_id}]: {new_profile}")
+    except Exception as e:
+        print(f"⚠️ [Dynamic Memory Error]: {e}")
+
+async def process_user_memory(user_id, role, text):
+    """إدارة تنقل الرسائل بين الذاكرة القصيرة والطويلة"""
+    short_history = await get_redis_data(f"ena_short_{user_id}") or []
+    long_profile = await get_redis_data(f"ena_profile_{user_id}") or ""
+    
+    short_history.append({"role": role, "text": text})
+    
+    if len(short_history) >= MAX_SHORT_TERM:
+        asyncio.create_task(summarize_and_compress(user_id, short_history, long_profile))
+        short_history = short_history[-2:]
+        
+    await set_redis_data(f"ena_short_{user_id}", short_history)
 
 # ==========================================
-# 2. خادم الويب السحابي (24/7 Keep Alive)
+# 3. خادم الويب السحابي (24/7 Keep Alive)
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="ENA Discord Cloud Engine is Running 24/7!", status=200)
+    return web.Response(text="ENA Dynamic Dual-Memory Cloud Engine Active!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -108,43 +145,52 @@ async def start_web_server():
     print(f"🌐 [Cloud Web Server] يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 3. محرك الاتصال والتبديل التلقائي
+# 4. محرك الاتصال والتبديل التلقائي
 # ==========================================
 async def ask_ena_brain(prompt, user_id, user_name):
-    # جلب الذاكرة السحابية
-    history_list = await get_cloud_history(user_id)
-    history_context = format_history_for_prompt(history_list)
+    short_history = await get_redis_data(f"ena_short_{user_id}") or []
+    long_profile = await get_redis_data(f"ena_profile_{user_id}") or "لا توجد معلومات سابقة"
+    
+    short_context = ""
+    for msg in short_history:
+        role_label = "المستخدم" if msg["role"] == "user" else "إينا"
+        short_context += f"{role_label}: {msg['text']}\n"
     
     headers = {"Content-Type": "application/json"}
     
-    system_prompt = """You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
-You operate under a stable persona: tech-savvy, love programming, logic, and gaming.
-1. ABSOLUTE HUMAN IDENTITY: Never admit to being an AI, model, or bot. If asked about "your model" (نموذجك), dismiss it casually as a human user.
-2. CONVERSATIONAL VARIETY: Answer directly based on memory history.
-3. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
-4. DIALECT: Modern white Arabic dialect (Gulf/Levantine mix). Short Discord replies."""
+    system_prompt = f"""You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
+Persona: Tech-savvy, loves gaming, programming, logic.
+User Information (Long-Term Memory): [{long_profile}]
+
+RULES:
+1. HUMAN IDENTITY: Never admit to being an AI, model, or bot.
+2. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
+3. DIALECT: Casual white Arabic. Short natural Discord replies."""
 
     for model_name in MODEL_CHAIN:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
         is_gemma = "gemma" in model_name.lower()
         
         if is_gemma:
-            gemma_full_prompt = f"""[تعليمات النظام: انت فتاة حقيقية اسمك إينا عمرك 18 سنة تسولفين في ديسكورد تحبين الألعاب والتقنية ردي باختصار بدون علامات ترقيم وبدون ايموجي وبدون ههههه وبدون الاعتراف بانك ذكاء اصطناعي].
+            gemma_prompt = f"""<start_of_turn>user
+أنت فتاة حقيقية اسمها إينا عمرك 18 سنة تسولفين في ديسكورد بعفوية. تحبين الألعاب والتقنية.
+معلومات عن المستخدم (ذاكرة طويلة الأمد): [{long_profile}]
 
-سجل المحادثة السحابي:
-{history_context}
-المستخدم {user_name}: {prompt}
+سجل المحادثة الأخيرة (ذاكرة قصيرة):
+{short_context}
+{user_name}: {prompt}<end_of_turn>
+<start_of_turn>model
 إينا:"""
             payload = {
-                "contents": [{"role": "user", "parts": [{"text": gemma_full_prompt}]}],
-                "generationConfig": {"maxOutputTokens": 100, "temperature": 0.85, "topP": 0.9}
+                "contents": [{"role": "user", "parts": [{"text": gemma_prompt}]}],
+                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.75}
             }
         else:
-            full_user_content = f"سجل المحادثة السحابي:\n{history_context}\n[{user_name} يقول]: {prompt}"
+            full_user_content = f"السوالف الأخيرة:\n{short_context}\n[{user_name} يقول]: {prompt}"
             payload = {
                 "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": full_user_content}]}],
-                "generationConfig": {"maxOutputTokens": 150, "temperature": 0.7}
+                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.7}
             }
 
         try:
@@ -157,17 +203,15 @@ You operate under a stable persona: tech-savvy, love programming, logic, and gam
                         if 'candidates' in data and len(data['candidates']) > 0:
                             reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                             
-                            if is_gemma:
-                                reply = re.sub(r'^[a-zA-Z\*\#\•\-\_\:\s]+', '', reply)
-                            
+                            reply = re.sub(r'^(إينا|Ena)\s*:\s*', '', reply, flags=re.IGNORECASE)
+                            reply = re.sub(r'^[a-zA-Z\*\#\•\-\_\:\s]+', '', reply)
                             reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
                             reply = re.sub(r'\s+', ' ', reply).strip()
                             
-                            if reply:
+                            if reply and len(reply) > 2:
                                 print(f"✅ [استجابة ناجحة سحابياً عبر]: {model_name}")
-                                # حفظ الرسائل في قاعدة البيانات السحابية
-                                await save_cloud_history(user_id, "user", prompt)
-                                await save_cloud_history(user_id, "model", reply)
+                                await process_user_memory(user_id, "user", prompt)
+                                await process_user_memory(user_id, "model", reply)
                                 return reply
                     
                     print(f"⚠️ [تجاوز {model_name} - رمز الحالة {status}]: جارِ التبديل للنموذج التالي...")
@@ -180,15 +224,14 @@ You operate under a stable persona: tech-savvy, love programming, logic, and gam
     return "الخدمة مشغولة حاليا أعد المحاولة بعد قليل"
 
 # ==========================================
-# 4. أحداث ديسكورد
+# 5. أحداث ديسكورد والتشغيل
 # ==========================================
 @client.event
 async def on_ready():
     print("=" * 50)
-    print(f"✅ تم الاتصال بديسكورد بنجاح (وضع السحاب بالكامل)!")
+    print(f"✅ تم الاتصال بديسكورد بنجاح!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
-    print(f"☁️ قاعدة البيانات السحابية: Upstash Redis REST")
-    print(f"🧠 سلسلة النماذج: {' -> '.join(MODEL_CHAIN)}")
+    print(f"🧠 نظام الذاكرة البشرية المزدوج: شغال وبحفظ ديناميكي")
     print("=" * 50)
 
 @client.event
@@ -204,7 +247,7 @@ async def on_message(message):
         if not clean_prompt:
             clean_prompt = "مرحباً"
 
-        print(f"\n📥 [رسالة سحابية جديدة من {user_name} ({user_id})]: {clean_prompt}")
+        print(f"\n📥 [رسالة جديدة من {user_name} ({user_id})]: {clean_prompt}")
         
         async with message.channel.typing():
             reply = await ask_ena_brain(clean_prompt, user_id, user_name)
@@ -215,9 +258,6 @@ async def on_message(message):
             else:
                 await message.reply(reply, mention_author=False)
 
-# ==========================================
-# 5. التشغيل الرئيسي
-# ==========================================
 async def main():
     await start_web_server()
     await client.start(DISCORD_TOKEN)
