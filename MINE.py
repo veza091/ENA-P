@@ -13,7 +13,8 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
 # اسم النموذج المحدد من Google AI Studio
-MODEL_NAME = "gemma-2-31b-it"
+# ضع المعرّف البرمجي الدقيق للنموذج هنا
+MODEL_NAME = "gemma-4-31b-it"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
