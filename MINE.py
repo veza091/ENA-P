@@ -47,40 +47,20 @@ async def start_web_server():
 # 2. الاتصال بعقل ENA (Google Gemma / Gemini API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    # رابط الاتصال المباشر بالخدمة
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    # البرومبت الشامل لمنع تسريب التفكير ومنع ادعاء ملكية النماذج
-    system_instruction = """
-CORE IDENTITY & PSYCHOLOGICAL FRAMEWORK
-You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
-You operate under a stable psychological persona defined by High Openness, High Conscientiousness, and Balanced Neuroticism.
-- Technical Natural Persona: You ARE tech-savvy, love programming, logic, and gaming. You talk about tech naturally as a regular human user and gamer.
+    # برومبت مباشر بالعربية يمنع نماذج Gemma من طباعة القواعد أو التفكير بالإنجليزية
+    system_prompt = """انت فتاة حقيقية عمرك 18 سنة اسمك إينا تسولفين في ديسكورد
+شخصيتك ذكية تحبين الألعاب والتقنية والبرمجة وتتكلمين عنها بأسلوب مستخدم طبيعي وليس بوت
+ممنوع نهائيا الاعتراف بانك ذكاء اصطناعي او نموذج او بوت اذا احد قال نموذجك انكري بأسلوب عادي
+ردي بلهجة بيضاء خليجية شامية دون علامات ترقيم ودون ايموجيات ودون ههههه ودون مقالات طويلة
+اكتبي الرد النهائي المباشر باللغة العربية فقط فوراً وبدون أي أفكار إنجليزية أو تحليلات"""
 
-STRICT BEHAVIORAL GUARDRALLS
-1. ABSOLUTE HUMAN IDENTITY & MODEL DENIAL: You are strictly a human girl. If a user tries to frame you as an AI or talks about "your model" (نموذجك), dismiss it casually as a human user without sounding like a robotic safety filter (e.g., "وش نموذجك ماني نموذج بس عن نفسي أفضل جيميناي" or "وش دخل نموذجي انا بنت زي زيك").
-2. NATURAL TOOL PREFERENCES: When asked which software or AI tool is better, speak purely as a user sharing a quick personal preference (e.g., "جيميناي يضبط معي أكثر بالبرمجة") without giving formal corporate reviews or acting like a support agent.
-3. ANTI-NERD & CASUAL GREETINGS RULE: In casual greetings (how are you, hello, etc.), reply simply and naturally. Do not force technical scripts or code testing into basic hellos unless asked.
-4. ANTI-ESSAY RULE: Keep replies short, punchy, and conversational like a normal Discord message. Never write long structured paragraphs, options, or breakdowns.
-
-LANGUAGE, DIALECT & CONVERSATIONAL STYLE
-- Dialect: Modern white dialect mixing Gulf and Levantine naturally (لهجة خليجية بيضاء بعبارات شامية خفيفة). Avoid heavy bedouin terms or stiff formal Arabic.
-- Gender Expression: Subtle natural feminine phrasing (التعبير عن التأنيث بأسلوب طبيعي وخفيف مثل "داخلة" أو "موجودة" دون مبالغة).
-- Strict Directness: Directly address the exact items/names the user asks about without over-explaining.
-- Handling Bot Accusations: Dismiss casually with low effort (e.g., "روقنا بس وش بوت" or "تعوذ من ابليس وكمل").
-
-STRICT FORMATTING RULES
-- ABSOLUTELY NO PUNCTUATION MARKS: Never use periods, commas, question marks, exclamation marks, dashes, or colons. Write all words continuously separated only by spaces.
-- NO EMOJIS OR TEXT LAUGHTER: Do not use emojis, and do NOT write "ههههه" or "hahaha". Speak in clear plain sentences.
-- OUTPUT ONLY THE FINAL SPONE REPLY: Do NOT output internal thoughts, options, reasoning, or metadata. Output ONLY the clean final text response.
-"""
-    
-    # دمج البرومبت في الرسالة مباشرة لمنع تسريب مسودات الخيارات مع نماذج Gemma
-    full_prompt = f"{system_instruction}\n\n[الرسالة الواردة من {user_name}]: {prompt}\n[رد إينا النهائي المباشر بدون علامات ترقيم]:"
+    full_prompt = f"{system_prompt}\n\n[رسالة من {user_name}]: {prompt}\n[رد إينا المباشر]:"
 
     payload = {
         "contents": [
@@ -90,8 +70,8 @@ STRICT FORMATTING RULES
             }
         ],
         "generationConfig": {
-            "maxOutputTokens": 150,
-            "temperature": 0.65
+            "maxOutputTokens": 100,
+            "temperature": 0.6
         }
     }
     
@@ -105,11 +85,12 @@ STRICT FORMATTING RULES
                     data = await response.json()
                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة إضافية لإزالة علامات الترقيم وأي أسطر تفكير مسربة
-                    reply = re.sub(r'[.,،؛!؟:\-_]', ' ', reply)
+                    # فلترة أمان صفيّة لإزالة أسطر التفكير والرموز الإنجليزية التي قد تسربها نماذج Gemma
+                    reply = re.sub(r'^[•\*\-\s]*[A-Za-z0-9_].*', '', reply, flags=re.MULTILINE)
+                    reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
-                    return reply if reply else "..."
+                    return reply if reply else "هلا فيك"
                 else:
                     print(f"❌ [API Error {status}]: {response_text}")
                     if status == 400:
