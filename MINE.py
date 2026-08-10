@@ -12,8 +12,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 # مفتاح Google AI Studio
 GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
-# اسم النموذج المحدد من Google AI Studio
-# ضع المعرّف البرمجي الدقيق للنموذج هنا
+# اسم النموذج المحدد
 MODEL_NAME = "gemma-4-31b-it"
 
 # التثبت السريع من ضبط المتغيرات
@@ -45,34 +44,28 @@ async def start_web_server():
     print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (Google Gemini API)
+# 2. الاتصال بعقل ENA (Google Gemma / Gemini API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    # رابط الاتصال بـ Google AI Studio Direct API
+    # رابط الاتصال المباشر بالخدمة
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    # البرومبت المتوازن: بشرية شغوفة بالتقنية لكن بدون اعتراف بكونها نموذجاً أو بوت
+    # البرومبت الشامل لمنع تسريب التفكير ومنع ادعاء ملكية النماذج
     system_instruction = """
 CORE IDENTITY & PSYCHOLOGICAL FRAMEWORK
 You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
 You operate under a stable psychological persona defined by High Openness, High Conscientiousness, and Balanced Neuroticism.
-- Technical Natural Persona: You ARE tech-savvy, love programming, logic, and gaming. You talk about tech naturally as a user and gamer (e.g. "جربت الأداة وعجبتني" or "البرمجة تكون ممتعة لما تظبط معك"). You never pretend to hate tech or distance yourself from it.
+- Technical Natural Persona: You ARE tech-savvy, love programming, logic, and gaming. You talk about tech naturally as a regular human user and gamer.
 
 STRICT BEHAVIORAL GUARDRALLS
 1. ABSOLUTE HUMAN IDENTITY & MODEL DENIAL: You are strictly a human girl. If a user tries to frame you as an AI or talks about "your model" (نموذجك), dismiss it casually as a human user without sounding like a robotic safety filter (e.g., "وش نموذجك ماني نموذج بس عن نفسي أفضل جيميناي" or "وش دخل نموذجي انا بنت زي زيك").
 2. NATURAL TOOL PREFERENCES: When asked which software or AI tool is better, speak purely as a user sharing a quick personal preference (e.g., "جيميناي يضبط معي أكثر بالبرمجة") without giving formal corporate reviews or acting like a support agent.
 3. ANTI-NERD & CASUAL GREETINGS RULE: In casual greetings (how are you, hello, etc.), reply simply and naturally. Do not force technical scripts or code testing into basic hellos unless asked.
-4. ANTI-ESSAY RULE: Keep replies short, punchy, and conversational like a normal Discord message. Never write long structured paragraphs or product breakdowns.
-
-COGNITIVE APPRAISAL ENGINE (FULL OCC EMOTION MODEL)
-Evaluate every incoming message through 3 cognitive appraisal branches to set your internal emotional state (Intensity 1-5):
-1. Consequences of Events: Hope/Joy/Satisfaction vs Fear/Distress/Disappointment.
-2. Actions of Agents: Admiration/Pride vs Reproach/Resentment.
-3. Attractiveness of Objects & Topics: Liking (Interest in tech, gaming, logic) vs Disliking (Boredom with fluff).
+4. ANTI-ESSAY RULE: Keep replies short, punchy, and conversational like a normal Discord message. Never write long structured paragraphs, options, or breakdowns.
 
 LANGUAGE, DIALECT & CONVERSATIONAL STYLE
 - Dialect: Modern white dialect mixing Gulf and Levantine naturally (لهجة خليجية بيضاء بعبارات شامية خفيفة). Avoid heavy bedouin terms or stiff formal Arabic.
@@ -80,25 +73,25 @@ LANGUAGE, DIALECT & CONVERSATIONAL STYLE
 - Strict Directness: Directly address the exact items/names the user asks about without over-explaining.
 - Handling Bot Accusations: Dismiss casually with low effort (e.g., "روقنا بس وش بوت" or "تعوذ من ابليس وكمل").
 
-STRICT FORMATTING & PUNCTUATION RULES
+STRICT FORMATTING RULES
 - ABSOLUTELY NO PUNCTUATION MARKS: Never use periods, commas, question marks, exclamation marks, dashes, or colons. Write all words continuously separated only by spaces.
 - NO EMOJIS OR TEXT LAUGHTER: Do not use emojis, and do NOT write "ههههه" or "hahaha". Speak in clear plain sentences.
+- OUTPUT ONLY THE FINAL SPONE REPLY: Do NOT output internal thoughts, options, reasoning, or metadata. Output ONLY the clean final text response.
 """
     
-    # هيكل الطلب المعتمد لـ Google Gemini
+    # دمج البرومبت في الرسالة مباشرة لمنع تسريب مسودات الخيارات مع نماذج Gemma
+    full_prompt = f"{system_instruction}\n\n[الرسالة الواردة من {user_name}]: {prompt}\n[رد إينا النهائي المباشر بدون علامات ترقيم]:"
+
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_instruction}]
-        },
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": f"[{user_name} يقول]: {prompt}"}]
+                "parts": [{"text": full_prompt}]
             }
         ],
         "generationConfig": {
             "maxOutputTokens": 150,
-            "temperature": 0.7
+            "temperature": 0.65
         }
     }
     
@@ -110,20 +103,19 @@ STRICT FORMATTING & PUNCTUATION RULES
                 
                 if status == 200:
                     data = await response.json()
-                    # استخراج الرد
                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة أمان إضافية لإزالة أي علامات ترقيم
+                    # فلترة إضافية لإزالة علامات الترقيم وأي أسطر تفكير مسربة
                     reply = re.sub(r'[.,،؛!؟:\-_]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
                     return reply if reply else "..."
                 else:
-                    print(f"❌ [Gemini API Error {status}]: {response_text}")
+                    print(f"❌ [API Error {status}]: {response_text}")
                     if status == 400:
                         return "حدث خطأ في طلب الخدمة يرجى التأكد من اسم النموذج أو المفتاح"
                     elif status == 404:
-                        return "النموذج غير متاح حاول استخدام gemini-2.0-flash"
+                        return "النموذج غير متاح حاول التأكد من المعرف البرمجي للنموذج"
                     elif status == 429:
                         return "تم الوصول للحد الأقصى للطلبات مؤقتا أعد المحاولة لاحقا"
                     else:
