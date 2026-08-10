@@ -16,7 +16,7 @@ GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY')
 REDIS_URL = os.getenv('UPSTASH_REDIS_REST_URL')
 REDIS_TOKEN = os.getenv('UPSTASH_REDIS_REST_TOKEN')
 
-# سلسلة التبديل السحابية عند استهلاك الحدود المجانية حسب الأولوية
+# سلسلة التبديل السحابية عند استهلاك الحدود
 MODEL_CHAIN = [
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
@@ -26,19 +26,17 @@ MODEL_CHAIN = [
 
 MAX_HISTORY_LENGTH = 10  # عدد الرسائل المحفوظة لكل مستخدم في السحاب
 
-# التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
-    print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN في إعدادات البيئة!")
+    print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN")
 if not GEMINI_API_KEY:
-    print("❌ خطأ: لم يتم العثور على المفتاح في إعدادات البيئة!")
+    print("❌ خطأ: لم يتم العثور على مفتاح API")
 
-# إعداد صلاحيات البوت في ديسكورد
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
 # ==========================================
-# 1. إدارة الذاكرة السحابية (Upstash Redis REST)
+# 1. إدارة الذاكرة السحابية (Cloud Database via Upstash)
 # ==========================================
 async def get_cloud_history(user_id):
     """جلب سجل المحادثة مباشرة من قاعدة البيانات السحابية"""
@@ -68,6 +66,7 @@ async def save_cloud_history(user_id, role, text):
     history = await get_cloud_history(user_id)
     history.append({"role": role, "text": text})
     
+    # الإبقاء على آخر N رسائل
     if len(history) > MAX_HISTORY_LENGTH:
         history = history[-MAX_HISTORY_LENGTH:]
         
@@ -92,7 +91,7 @@ def format_history_for_prompt(history_list):
     return formatted_context
 
 # ==========================================
-# 2. خادم الويب السحابي (إبقاء الخدمة تعمل 24/7)
+# 2. خادم الويب السحابي (24/7 Keep Alive)
 # ==========================================
 async def handle_ping(request):
     return web.Response(text="ENA Discord Cloud Engine is Running 24/7!", status=200)
@@ -106,13 +105,13 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 [Web Server] الخادم السحابي يعمل بنجاح على المنفذ: {port}")
+    print(f"🌐 [Cloud Web Server] يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 3. محرك التبديل الهجين وتكييف الطلب (Gemini + Gemma)
+# 3. محرك الاتصال والتبديل التلقائي
 # ==========================================
 async def ask_ena_brain(prompt, user_id, user_name):
-    # جلب الذاكرة السحابية للمستخدم
+    # جلب الذاكرة السحابية
     history_list = await get_cloud_history(user_id)
     history_context = format_history_for_prompt(history_list)
     
@@ -120,17 +119,15 @@ async def ask_ena_brain(prompt, user_id, user_name):
     
     system_prompt = """You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
 You operate under a stable persona: tech-savvy, love programming, logic, and gaming.
-1. ABSOLUTE HUMAN IDENTITY: Never admit to being an AI, model, or bot. If asked about "your model" (نموذجك), dismiss it casually as a human user (e.g. "وش نموذجك ماني نموذج").
-2. CONVERSATIONAL VARIETY: Answer directly and dynamically based on memory history.
+1. ABSOLUTE HUMAN IDENTITY: Never admit to being an AI, model, or bot. If asked about "your model" (نموذجك), dismiss it casually as a human user.
+2. CONVERSATIONAL VARIETY: Answer directly based on memory history.
 3. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
-4. DIALECT: Modern white Arabic dialect (Gulf/Levantine mix). Short, natural Discord replies."""
+4. DIALECT: Modern white Arabic dialect (Gulf/Levantine mix). Short Discord replies."""
 
-    # محاولة الاتصال بالنماذج حسب ترتيب الأولوية والحدود
     for model_name in MODEL_CHAIN:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
         is_gemma = "gemma" in model_name.lower()
         
-        # التكييف البرمجي للهيكل بناءً على نوع النموذج (Gemma أم Gemini)
         if is_gemma:
             gemma_full_prompt = f"""[تعليمات النظام: انت فتاة حقيقية اسمك إينا عمرك 18 سنة تسولفين في ديسكورد تحبين الألعاب والتقنية ردي باختصار بدون علامات ترقيم وبدون ايموجي وبدون ههههه وبدون الاعتراف بانك ذكاء اصطناعي].
 
@@ -160,7 +157,6 @@ You operate under a stable persona: tech-savvy, love programming, logic, and gam
                         if 'candidates' in data and len(data['candidates']) > 0:
                             reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                             
-                            # تنظيف مخصص لنماذج Gemma لإزالة أسطر التفكير والرموز
                             if is_gemma:
                                 reply = re.sub(r'^[a-zA-Z\*\#\•\-\_\:\s]+', '', reply)
                             
@@ -168,23 +164,23 @@ You operate under a stable persona: tech-savvy, love programming, logic, and gam
                             reply = re.sub(r'\s+', ' ', reply).strip()
                             
                             if reply:
-                                print(f"✅ [رد ناجح بواسطة النموذج]: {model_name}")
+                                print(f"✅ [استجابة ناجحة سحابياً عبر]: {model_name}")
                                 # حفظ الرسائل في قاعدة البيانات السحابية
                                 await save_cloud_history(user_id, "user", prompt)
                                 await save_cloud_history(user_id, "model", reply)
                                 return reply
                     
-                    print(f"⚠️ [تجاوز النموذج {model_name} بسبب كود الحالة {status}]: الانتقال للنموذج التالي...")
+                    print(f"⚠️ [تجاوز {model_name} - رمز الحالة {status}]: جارِ التبديل للنموذج التالي...")
                     continue
 
         except Exception as e:
-            print(f"⚠️ [فشل الاتصال بالنموذج {model_name}]: {e} -> جارِ الانتقال للنموذج التالي...")
+            print(f"⚠️ [خطأ اتصال بـ {model_name}]: {e} -> الانتقال للنموذج التالي...")
             continue
 
     return "الخدمة مشغولة حاليا أعد المحاولة بعد قليل"
 
 # ==========================================
-# 4. أحداث ديسكورد (Discord Events)
+# 4. أحداث ديسكورد
 # ==========================================
 @client.event
 async def on_ready():
@@ -192,7 +188,7 @@ async def on_ready():
     print(f"✅ تم الاتصال بديسكورد بنجاح (وضع السحاب بالكامل)!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
     print(f"☁️ قاعدة البيانات السحابية: Upstash Redis REST")
-    print(f"🧠 سلسلة النماذج والتبديل: {' -> '.join(MODEL_CHAIN)}")
+    print(f"🧠 سلسلة النماذج: {' -> '.join(MODEL_CHAIN)}")
     print("=" * 50)
 
 @client.event
@@ -208,7 +204,7 @@ async def on_message(message):
         if not clean_prompt:
             clean_prompt = "مرحباً"
 
-        print(f"\n📥 [رسالة جديدة من {user_name} ({user_id})]: {clean_prompt}")
+        print(f"\n📥 [رسالة سحابية جديدة من {user_name} ({user_id})]: {clean_prompt}")
         
         async with message.channel.typing():
             reply = await ask_ena_brain(clean_prompt, user_id, user_name)
