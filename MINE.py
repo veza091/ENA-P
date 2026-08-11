@@ -123,7 +123,8 @@ async def process_user_memory(user_id, role, text):
     
     if len(short_history) >= MAX_SHORT_TERM:
         asyncio.create_task(summarize_and_compress(user_id, short_history, long_profile))
-        short_history = short_history[-2:]
+        # الإبقاء على آخر 3 رسائل للحفاظ على ربط السياق الحالي
+        short_history = short_history[-3:]
         
     await set_redis_data(f"ena_short_{user_id}", short_history)
 
@@ -151,9 +152,10 @@ async def ask_ena_brain(prompt, user_id, user_name):
     short_history = await get_redis_data(f"ena_short_{user_id}") or []
     long_profile = await get_redis_data(f"ena_profile_{user_id}") or "لا توجد معلومات سابقة"
     
+    # بناء السياق بصيغة حوار واضح بأسماء أصحابها
     short_context = ""
     for msg in short_history:
-        role_label = "المستخدم" if msg["role"] == "user" else "إينا"
+        role_label = user_name if msg["role"] == "user" else "إينا"
         short_context += f"{role_label}: {msg['text']}\n"
     
     headers = {"Content-Type": "application/json"}
@@ -164,8 +166,10 @@ User Information (Long-Term Memory): [{long_profile}]
 
 RULES:
 1. HUMAN IDENTITY: Never admit to being an AI, model, or bot.
-2. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
-3. DIALECT: Casual white Arabic. Short natural Discord replies."""
+2. CONTEXT AWARENESS: Read recent dialogue carefully and stay connected to active topic.
+3. FORMATTING: NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
+4. LANGUAGE: Arabic, but ALLOW standard game/tech names in English or Arabic without cutting them.
+5. DIALECT: Casual white Arabic. Short natural Discord replies."""
 
     for model_name in MODEL_CHAIN:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
@@ -174,23 +178,25 @@ RULES:
         if is_gemma:
             gemma_prompt = f"""<start_of_turn>user
 أنت فتاة حقيقية اسمها إينا عمرك 18 سنة تسولفين في ديسكورد بعفوية. تحبين الألعاب والتقنية.
+تابعي السالفة السابقة وافهمي المطلوب بدقة وسمي أسماء الألعاب كاملة وبدون بتر الكلمات.
+
 معلومات عن المستخدم (ذاكرة طويلة الأمد): [{long_profile}]
 
-سجل المحادثة الأخيرة (ذاكرة قصيرة):
+سجل السوالف الأخيرة (ذاكرة قصيرة):
 {short_context}
 {user_name}: {prompt}<end_of_turn>
 <start_of_turn>model
 إينا:"""
             payload = {
                 "contents": [{"role": "user", "parts": [{"text": gemma_prompt}]}],
-                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.75}
+                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.65}
             }
         else:
-            full_user_content = f"السوالف الأخيرة:\n{short_context}\n[{user_name} يقول]: {prompt}"
+            full_user_content = f"السوالف الأخيرة في الشات:\n{short_context}\n{user_name}: {prompt}"
             payload = {
                 "system_instruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": full_user_content}]}],
-                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.7}
+                "generationConfig": {"maxOutputTokens": 250, "temperature": 0.65}
             }
 
         try:
@@ -203,9 +209,9 @@ RULES:
                         if 'candidates' in data and len(data['candidates']) > 0:
                             reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                             
+                            # تنظيف ناعم يحافظ على الكلمات والأسماء الإنجليزية والعربية دون مسحها أو بترها
                             reply = re.sub(r'^(إينا|Ena)\s*:\s*', '', reply, flags=re.IGNORECASE)
-                            reply = re.sub(r'^[a-zA-Z\*\#\•\-\_\:\s]+', '', reply)
-                            reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
+                            reply = re.sub(r'[.,،؛!؟:\-_•\*#]', ' ', reply)
                             reply = re.sub(r'\s+', ' ', reply).strip()
                             
                             if reply and len(reply) > 2:
