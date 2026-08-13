@@ -22,17 +22,16 @@ Persona: Tech-savvy, loves gaming, programming, logic.
 
 RULES:
 1. HUMAN IDENTITY: Never admit to being an AI, model, or bot.
-2. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
-3. LANGUAGE: Casual Arabic. Allow natural game and tech names (like Witcher, Cyberpunk, etc.) without truncating them.
-4. DIALECT: Short natural Discord replies."""
+2. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO QUOTATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
+3. LANGUAGE: Casual Arabic. Allow natural game and tech names without truncating them.
+4. DIALECT: Casual natural white Arabic. Short natural Discord replies. Complete every sentence fully."""
 
-# إنشاء النموذج مع التعليمات الأساسية
+# إنشاء النموذج بدون تحديد حد أقصى للرموز (Uncapped Generation)
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",  # أو gemini-1.5-pro / gemini-2.0-flash حسب النماذج المتاحة في المفتاح
+    model_name="gemini-1.5-flash",
     system_instruction=SYSTEM_INSTRUCTION,
     generation_config={
-        "temperature": 0.7,
-        "max_output_tokens": 250
+        "temperature": 0.7
     }
 )
 
@@ -45,12 +44,9 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 def clean_reply(text):
-    """تنظيف النص من علامات الترقيم فقط مع الحفاظ الكامل على الكلمات العربية والإنجليزية"""
-    # إزالة بادئة الاسم إذا وُجدت
+    """تنظيف النص من علامات الترقيم والتنصيص مع الحفاظ الكامل على الكلمات"""
     text = re.sub(r'^(إينا|Ena)\s*:\s*', '', text, flags=re.IGNORECASE)
-    # إزالة علامات الترقيم والرموز الخاصة
-    text = re.sub(r'[.,،؛!؟:\-_•\*#]', ' ', text)
-    # تقليص المسافات الزائدة
+    text = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -59,7 +55,7 @@ async def on_ready():
     print("=" * 50)
     print(f"✅ تم الاتصال بديسكورد بنجاح!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
-    print("⚙️ وضع التطوير الأساسي: بدون ذاكرة خارجية / بدون تبديل نماذج")
+    print("⚙️ وضع التوليد الحر: بدون حد أقصى للرموز (No max_output_tokens)")
     print("=" * 50)
 
 @client.event
@@ -68,7 +64,6 @@ async def on_message(message):
         return
 
     if client.user in message.mentions:
-        # إزالة التاغ للحصول على نص المستخدم الصافي
         clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
         user_name = message.author.display_name
         
@@ -79,7 +74,6 @@ async def on_message(message):
         
         async with message.channel.typing():
             try:
-                # إرسال الرسالة مباشرة للجلسة
                 formatted_input = f"{user_name}: {clean_prompt}"
                 response = await asyncio.to_thread(chat_session.send_message, formatted_input)
                 
