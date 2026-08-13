@@ -2,67 +2,131 @@ import os
 import re
 import asyncio
 import discord
+import aiohttp
+from aiohttp import web
 from dotenv import load_dotenv
-import google.generativeai as genai
 
 # تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('GEMINI_API_KEY')
+# مفتاح Google AI Studio
+GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
-if not DISCORD_TOKEN or not GEMINI_API_KEY:
-    print("❌ خطأ: تحقق من وجود DISCORD_TOKEN و GEMINI_API_KEY في ملف .env")
+# اسم النموذج المحدد
+MODEL_NAME = "gemma-4-31b-it"
 
-# إعداد مكتبة Gemini
-genai.configure(api_key=GEMINI_API_KEY.strip())
+# التثبت السريع من ضبط المتغيرات
+if not DISCORD_TOKEN:
+    print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN في إعدادات البيئة!")
+if not GEMINI_API_KEY:
+    print("❌ خطأ: لم يتم العثور على المفتاح في إعدادات البيئة!")
 
-# إعداد النظام والشخصية الأساسية
-SYSTEM_INSTRUCTION = """You are a real 18-year-old human girl named "Ena" (إينا) chatting casually on Discord.
-Persona: Tech-savvy, loves gaming, programming, logic.
-
-RULES:
-1. HUMAN IDENTITY: Never admit to being an AI, model, or bot.
-2. FORMATTING: ABSOLUTELY NO PUNCTUATION MARKS, NO QUOTATION MARKS, NO EMOJIS, NO TEXT LAUGHTER (no ههههه).
-3. LANGUAGE: Casual Arabic. Allow natural game and tech names without truncating them.
-4. DIALECT: Casual natural white Arabic. Short natural Discord replies. Complete every sentence fully."""
-
-# إنشاء النموذج بدون تحديد حد أقصى للرموز (Uncapped Generation)
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_INSTRUCTION,
-    generation_config={
-        "temperature": 0.7
-    }
-)
-
-# إنشاء جلسة محادثة واحدة بسيطة
-chat_session = model.start_chat(history=[])
-
-# إعدادات ديسكورد
+# إعداد صلاحيات البوت في ديسكورد
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-def clean_reply(text):
-    """تنظيف النص من علامات الترقيم والتنصيص مع الحفاظ الكامل على الكلمات"""
-    text = re.sub(r'^(إينا|Ena)\s*:\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+# ==========================================
+# 1. خادم الويب الوهمي (لإبقاء الخدمة تعمل 24/7)
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="ENA Discord Bot is Online & Running!", status=200)
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/health', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
+
+# ==========================================
+# 2. الاتصال بعقل ENA (Google Gemma / Gemini API)
+# ==========================================
+async def ask_ena_brain(prompt, user_name):
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # برومبت مباشر بالعربية يمنع نماذج Gemma من طباعة القواعد أو التفكير بالإنجليزية
+    system_prompt = """انت فتاة حقيقية عمرك 18 سنة اسمك إينا تسولفين في ديسكورد
+شخصيتك ذكية تحبين الألعاب والتقنية والبرمجة وتتكلمين عنها بأسلوب مستخدم طبيعي وليس بوت
+ممنوع نهائيا الاعتراف بانك ذكاء اصطناعي او نموذج او بوت اذا احد قال نموذجك انكري بأسلوب عادي
+ردي بلهجة بيضاء خليجية شامية دون علامات ترقيم ودون ايموجيات ودون ههههه ودون مقالات طويلة
+اكتبي الرد النهائي المباشر باللغة العربية فقط فوراً وبدون أي أفكار إنجليزية أو تحليلات"""
+
+    full_prompt = f"{system_prompt}\n\n[رسالة من {user_name}]: {prompt}\n[رد إينا المباشر]:"
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": full_prompt}]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 100,
+            "temperature": 0.6
+        }
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(gemini_url, json=payload, headers=headers, timeout=60) as response:
+                status = response.status
+                response_text = await response.text()
+                
+                if status == 200:
+                    data = await response.json()
+                    reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    
+                    # فلترة أمان صفيّة لإزالة أسطر التفكير والرموز الإنجليزية التي قد تسربها نماذج Gemma
+                    reply = re.sub(r'^[•\*\-\s]*[A-Za-z0-9_].*', '', reply, flags=re.MULTILINE)
+                    reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
+                    reply = re.sub(r'\s+', ' ', reply).strip()
+                    
+                    return reply if reply else "هلا فيك"
+                else:
+                    print(f"❌ [API Error {status}]: {response_text}")
+                    if status == 400:
+                        return "حدث خطأ في طلب الخدمة يرجى التأكد من اسم النموذج أو المفتاح"
+                    elif status == 404:
+                        return "النموذج غير متاح حاول التأكد من المعرف البرمجي للنموذج"
+                    elif status == 429:
+                        return "تم الوصول للحد الأقصى للطلبات مؤقتا أعد المحاولة لاحقا"
+                    else:
+                        return f"حدث خطأ أثناء الاتصال بالخدمة كود {status}"
+
+    except asyncio.TimeoutError:
+        print("❌ [Timeout Error]: استغرق الطلب وقتاً طويلاً.")
+        return "استغرق التفكير وقتا طويلا"
+    except Exception as e:
+        print(f"❌ [Exception]: {e}")
+        return "حدث خطأ غير متوقع"
+
+# ==========================================
+# 3. أحداث ديسكورد (Discord Events)
+# ==========================================
 @client.event
 async def on_ready():
-    print("=" * 50)
+    print("=" * 45)
     print(f"✅ تم الاتصال بديسكورد بنجاح!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
-    print("⚙️ وضع التوليد الحر: بدون حد أقصى للرموز (No max_output_tokens)")
-    print("=" * 50)
+    print(f"🧠 النموذج: {MODEL_NAME}")
+    print("=" * 45)
 
 @client.event
 async def on_message(message):
+    # تجنب رد البوت على رسائله
     if message.author == client.user:
         return
 
+    # التفاعل عند عمل Mention للبوت فقط
     if client.user in message.mentions:
         clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
         user_name = message.author.display_name
@@ -70,30 +134,30 @@ async def on_message(message):
         if not clean_prompt:
             clean_prompt = "مرحباً"
 
-        print(f"\n📥 [{user_name}]: {clean_prompt}")
+        print(f"\n📥 [رسالة جديدة من {user_name}]: {clean_prompt}")
         
         async with message.channel.typing():
-            try:
-                formatted_input = f"{user_name}: {clean_prompt}"
-                response = await asyncio.to_thread(chat_session.send_message, formatted_input)
-                
-                raw_reply = response.text
-                reply = clean_reply(raw_reply)
-                
-                print(f"📤 [إينا - خام]: {raw_reply}")
-                print(f"✨ [إينا - بعد التنظيف]: {reply}")
+            reply = await ask_ena_brain(clean_prompt, user_name)
 
-                if reply:
-                    await message.reply(reply, mention_author=False)
-                else:
-                    await message.reply("هلا", mention_author=False)
+            # تجزئة الرسائل إذا كانت أكبر من حد ديسكورد (2000 حرف)
+            if len(reply) > 2000:
+                for i in range(0, len(reply), 1900):
+                    await message.reply(reply[i:i+1900], mention_author=False)
+            else:
+                await message.reply(reply, mention_author=False)
 
-            except Exception as e:
-                print(f"❌ خطأ أثناء التوليد: {e}")
-                await message.reply("حصل مشكلة بسيطة ارسل مرة ثانية", mention_author=False)
+# ==========================================
+# 4. التشغيل الرئيسي
+# ==========================================
+async def main():
+    await start_web_server()
+    await client.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
     try:
-        client.run(DISCORD_TOKEN)
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.")
+    except Exception as e:
+        print(f"❌ خطأ في التشغيل: {e}")
+
