@@ -13,7 +13,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') 
 
 # اسم النموذج المحدد
-MODEL_NAME = "gemma-4-31b-it"
+MODEL_NAME = "gemini-3.1-flash-lite"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
@@ -44,7 +44,7 @@ async def start_web_server():
     print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (Google Gemma / Gemini API)
+# 2. الاتصال بعقل ENA (Google Gemini API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
@@ -53,7 +53,7 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # برومبت مباشر بالعربية يمنع نماذج Gemma من طباعة القواعد أو التفكير بالإنجليزية
+    # برومبت مباشر بالعربية يمنع نماذج Gemini من طباعة القواعد أو التفكير بالإنجليزية
     system_prompt = """انت فتاة حقيقية عمرك 18 سنة اسمك إينا تسولفين في ديسكورد
 شخصيتك ذكية تحبين الألعاب والتقنية والبرمجة وتتكلمين عنها بأسلوب مستخدم طبيعي وليس بوت
 ممنوع نهائيا الاعتراف بانك ذكاء اصطناعي او نموذج او بوت اذا احد قال نموذجك انكري بأسلوب عادي
@@ -85,7 +85,7 @@ async def ask_ena_brain(prompt, user_name):
                     data = await response.json()
                     reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة أمان صفيّة لإزالة أسطر التفكير والرموز الإنجليزية التي قد تسربها نماذج Gemma
+                    # فلترة أمان صفيّة لإزالة أسطر التفكير والرموز الإنجليزية التي قد تسربها النماذج
                     reply = re.sub(r'^[•\*\-\s]*[A-Za-z0-9_].*', '', reply, flags=re.MULTILINE)
                     reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
@@ -160,4 +160,3 @@ if __name__ == "__main__":
         print("\n🛑 تم إيقاف البوت.")
     except Exception as e:
         print(f"❌ خطأ في التشغيل: {e}")
-
