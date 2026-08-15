@@ -44,7 +44,7 @@ async def start_web_server():
     print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (Google Gemini API)
+# 2. الاتصال بعقل ENA (Google AI Studio API)
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
@@ -85,11 +85,13 @@ async def ask_ena_brain(prompt, user_name):
                 
                 if status == 200:
                     data = await response.json()
-                    reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    raw_reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # فلترة أمان إضافية لإزالة أي علامات ترقيم قد تظهر
-                    reply = re.sub(r'^[•\*\-\s]*[A-Za-z0-9_].*', '', reply, flags=re.MULTILINE)
-                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', reply)
+                    # طباعة الرد الخام للتأكد من وصوله ومحتواه
+                    print(f"🔍 [RAW RESPONSE FROM {MODEL_NAME}]: {raw_reply}")
+                    
+                    # تنظيف علامات الترقيم فقط دون مسح النصوص والكلمات
+                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', raw_reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
                     return reply if reply else "هلا"
