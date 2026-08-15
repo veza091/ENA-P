@@ -13,7 +13,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('GEMINI_API_KEY')
 
 # اسم النموذج المحدد
-MODEL_NAME = "gemini-3.1-flash-lite"
+MODEL_NAME = "gemma-4-31b-it"
 
 # التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN:
