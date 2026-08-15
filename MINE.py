@@ -53,29 +53,22 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # نمط الأمثلة (Few-Shot) لإلزام Gemma بالنمط ومنعه من تلخيص أو إخراج قواعد بالإنجليزية
-    full_prompt = f"""أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية واختصار بدون علامات ترقيم ولا إيموجي.
-
-أمثلة على ردودك:
-[رسالة من أحمد]: كيف حالك
-[رد إينا المباشر]: بخير وانت
-
-[رسالة من علي]: ملل
-[رد إينا المباشر]: روح نام
-
-[رسالة من خالد]: وش تسوين
-[رد إينا المباشر]: ولا شيء قاعدة
-
-الآن ردي على هذه الرسالة فقط باللغة العربية وبنفس الأسلوب المختصر:
-[رسالة من {user_name}]: {prompt}
-[رد إينا المباشر]:"""
-
+    # تحويل الهيكلة إلى وضع الدردشة المتعددة (Multi-turn Chat) وتفعيل system_instruction
+    # هذا يمنع النموذج نهائياً من كتابة وصف Persona بالإنجليزية ويجبره على الرد كشخصية في محادثة
     payload = {
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": "أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية واختصار شديد بدون علامات ترقيم ولا إيموجي. ردي دائماً باللغة العربية فقط وممنوع استخدام الإنجليزية."
+                }
+            ]
+        },
         "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": full_prompt}]
-            }
+            {"role": "user", "parts": [{"text": "كيف حالك"}]},
+            {"role": "model", "parts": [{"text": "بخير وانت"}]},
+            {"role": "user", "parts": [{"text": "ملل"}]},
+            {"role": "model", "parts": [{"text": "روح نام"}]},
+            {"role": "user", "parts": [{"text": f"رسالة من {user_name}: {prompt}"}]}
         ],
         "generationConfig": {
             "maxOutputTokens": 40,
@@ -93,10 +86,10 @@ async def ask_ena_brain(prompt, user_name):
                     data = await response.json()
                     raw_reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # طباعة الرد الخام لتتبع أداء Gemma في التيرمينال
+                    # طباعة الرد الخام للتأكد من المحتوى في سجلات Render
                     print(f"🔍 [RAW RESPONSE FROM {MODEL_NAME}]: {raw_reply}")
                     
-                    # تنظيف علامات الترقيم فقط
+                    # تنظيف علامات الترقيم
                     reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', raw_reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
