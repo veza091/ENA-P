@@ -53,13 +53,12 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # تحويل الهيكلة إلى وضع الدردشة المتعددة (Multi-turn Chat) وتفعيل system_instruction
-    # هذا يمنع النموذج نهائياً من كتابة وصف Persona بالإنجليزية ويجبره على الرد كشخصية في محادثة
+    # تم تمرير النص الصافي المباشر لمنع Gemma من كتابة User input و Persona بالإنجليزية
     payload = {
         "system_instruction": {
             "parts": [
                 {
-                    "text": "أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية واختصار شديد بدون علامات ترقيم ولا إيموجي. ردي دائماً باللغة العربية فقط وممنوع استخدام الإنجليزية."
+                    "text": "أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية واختصار شديد بدون علامات ترقيم ولا إيموجي. ردي دائماً باللغة العربية فقط وبشكل مقتضب جداً وممنوع كتابة أي كلام بالإنجليزية."
                 }
             ]
         },
@@ -68,7 +67,7 @@ async def ask_ena_brain(prompt, user_name):
             {"role": "model", "parts": [{"text": "بخير وانت"}]},
             {"role": "user", "parts": [{"text": "ملل"}]},
             {"role": "model", "parts": [{"text": "روح نام"}]},
-            {"role": "user", "parts": [{"text": f"رسالة من {user_name}: {prompt}"}]}
+            {"role": "user", "parts": [{"text": prompt}]}  # إرسال الرسالة مباشرة دون إضافات
         ],
         "generationConfig": {
             "maxOutputTokens": 40,
@@ -86,10 +85,10 @@ async def ask_ena_brain(prompt, user_name):
                     data = await response.json()
                     raw_reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     
-                    # طباعة الرد الخام للتأكد من المحتوى في سجلات Render
+                    # طباعة الرد الخام للتأكد من المحتوى في سجلات Console
                     print(f"🔍 [RAW RESPONSE FROM {MODEL_NAME}]: {raw_reply}")
                     
-                    # تنظيف علامات الترقيم
+                    # تنظيف علامات الترقيم والأقواس
                     reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', raw_reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
