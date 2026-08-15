@@ -53,25 +53,24 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # تم تمرير النص الصافي المباشر لمنع Gemma من كتابة User input و Persona بالإنجليزية
+    # تمرير رسالة المستخدم الصافية فقط لإلزام Gemma بالرد المباشر دون شرح أو تحليل
     payload = {
         "system_instruction": {
             "parts": [
                 {
-                    "text": "أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية واختصار شديد بدون علامات ترقيم ولا إيموجي. ردي دائماً باللغة العربية فقط وبشكل مقتضب جداً وممنوع كتابة أي كلام بالإنجليزية."
+                    "text": "أنتِ فتاة اسمك إينا. تتحدثين في ديسكورد بعفوية واختصار شديد. ردي مباشرة على كلام المستخدم باللغة العربية فقط وبشكل مقتضب جداً دون كتابة أي تحليلات أو كلمات باللغة الإنجليزية ودون استخدام إيموجي أو علامات ترقيم."
                 }
             ]
         },
         "contents": [
-            {"role": "user", "parts": [{"text": "كيف حالك"}]},
-            {"role": "model", "parts": [{"text": "بخير وانت"}]},
-            {"role": "user", "parts": [{"text": "ملل"}]},
-            {"role": "model", "parts": [{"text": "روح نام"}]},
-            {"role": "user", "parts": [{"text": prompt}]}  # إرسال الرسالة مباشرة دون إضافات
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
         ],
         "generationConfig": {
-            "maxOutputTokens": 40,
-            "temperature": 0.3
+            "maxOutputTokens": 30,
+            "temperature": 0.2
         }
     }
     
@@ -89,7 +88,7 @@ async def ask_ena_brain(prompt, user_name):
                     print(f"🔍 [RAW RESPONSE FROM {MODEL_NAME}]: {raw_reply}")
                     
                     # تنظيف علامات الترقيم والأقواس
-                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»]', ' ', raw_reply)
+                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»\(\)]', ' ', raw_reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
                     return reply if reply else "هلا"
