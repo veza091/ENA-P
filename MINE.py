@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import asyncio
 import discord
@@ -9,25 +10,24 @@ from dotenv import load_dotenv
 # تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# مفتاح Google AI Studio
-GEMINI_API_KEY = os.getenv('OPENROUTER_API_KEY') or os.getenv('GEMINI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-# اسم النموذج المحدد
 MODEL_NAME = "gemma-4-31b-it"
 
-# التثبت السريع من ضبط المتغيرات
-if not DISCORD_TOKEN:
-    print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN في إعدادات البيئة!")
-if not GEMINI_API_KEY:
-    print("❌ خطأ: لم يتم العثور على المفتاح في إعدادات البيئة!")
+# 7. الإغلاق الفوري عند غياب التوكنات لتفادي الأخطاء الصامتة
+if not DISCORD_TOKEN or not GEMINI_API_KEY:
+    print("❌ خطأ قاتل: لم يتم العثور على DISCORD_TOKEN أو GEMINI_API_KEY!")
+    sys.exit(1)
 
-# إعداد صلاحيات البوت في ديسكورد
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# متغير لجلسة HTTP الموحدة (Connection Pooling)
+http_session = None
+
 # ==========================================
-# 1. خادم الويب الوهمي (لإبقاء الخدمة تعمل 24/7)
+# 1. خادم الويب لإبقاء البوت يعمل 24/7
 # ==========================================
 async def handle_ping(request):
     return web.Response(text="ENA Discord Bot is Online & Running!", status=200)
@@ -41,76 +41,90 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
+    print(f"🌐 [Web Server] الخادم يعمل على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (Google AI Studio API)
+# 2. الاستعلام من API
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY.strip() if GEMINI_API_KEY else ''}"
+    global http_session
     
+    # 11. تمرير المفتاح في Header لتأمين السجلات
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
     headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY.strip()
     }
     
-    # دمج التوجيه المباشر داخل النص وإلغاء system_instruction لمنع Gemma من ترجمة التوجيهات وطباعتها
-    full_prompt = f"أنتِ فتاة اسمك إينا تسولفين في ديسكورد. ردي بعفوية واختصار شديد باللغة العربية فقط وبدون أي كلمة إنجليزية على هذه الرسالة:\n{prompt}"
+    # هيكلة البرومبت واستغلال user_name + إغلاق البرومبت بمؤشر استكمال
+    formatted_prompt = (
+        "أنتِ فتاة اسمك إينا تسولفين في ديسكورد بعفوية شديدة.\n"
+        "قواعد صارمة:\n"
+        "1. ردي بالعامية فقط وبجملة واحدة قصيرة جداً.\n"
+        "2. يمنع كتابة أي حرف إنجليزي أو شرح لرسالتك.\n\n"
+        f"المستخدم ({user_name}) يقول لكِ: {prompt}\n"
+        "رد إينا:"
+    )
 
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": full_prompt}]
-            }
-        ],
+        "contents": [{"role": "user", "parts": [{"text": formatted_prompt}]}],
         "generationConfig": {
-            "maxOutputTokens": 30,
-            "temperature": 0.6,
-            "topP": 0.85
+            "maxOutputTokens": 60,  # 8. رفع السقف لمنع قطع الكلمات العربية
+            "temperature": 0.7,     # رفع العشوائية قليلاً لإعطاء طابع بشري
+            "topP": 0.85,
+            "stopSequences": ["User says:", "Persona:", "\n\n"] # 12. حصر القائمة في عناصر أساسية
         }
     }
     
+    # 10. جملة احتياطية داخل الشخصية عند حدوث أي خطأ
+    in_character_fallback = "النت فصل عندي لحظة عيدي كلامك"
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(gemini_url, json=payload, headers=headers, timeout=60) as response:
-                status = response.status
-                response_text = await response.text()
+        # 3. إعادة استخدام الجلسة الموحدة بدلاً من فتح اتصال جديد في كل طلب
+        async with http_session.post(gemini_url, json=payload, headers=headers, timeout=30) as response:
+            status = response.status
+            
+            if status == 200:
+                data = await response.json()
+                candidates = data.get('candidates', [])
                 
-                if status == 200:
-                    data = await response.json()
-                    raw_reply = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                # 5. التعامل مع ردود الأمان أو الإجابات الفارغة
+                if candidates and 'content' in candidates[0] and 'parts' in candidates[0]['content']:
+                    raw_reply = candidates[0]['content']['parts'][0]['text'].strip()
+                    print(f"🔍 [RAW RESPONSE]: {raw_reply}")
                     
-                    # طباعة الرد الخام للتأكد من المحتوى في سجلات Console
-                    print(f"🔍 [RAW RESPONSE FROM {MODEL_NAME}]: {raw_reply}")
-                    
-                    # تنظيف علامات الترقيم والأقواس
-                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»\(\)]', ' ', raw_reply)
+                    # فلترة سريعة لإزالة أي حروف لاتينية متسربة وتنظيف علامات الترقيم
+                    reply = re.sub(r'[a-zA-Z]', '', raw_reply)
+                    reply = re.sub(r'[.,،؛!؟:\-_•\*#""\'`«»\(\)]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
                     
-                    return reply if reply else "هلا"
+                    return reply if reply else in_character_fallback
                 else:
-                    print(f"❌ [API Error {status}]: {response_text}")
-                    if status == 400:
-                        return "حدث خطأ في طلب الخدمة يرجى التأكد من اسم النموذج أو المفتاح"
-                    elif status == 404:
-                        return "النموذج غير متاح حاول التأكد من المعرف البرمجي للنموذج"
-                    elif status == 429:
-                        return "تم الوصول للحد الأقصى للطلبات مؤقتا أعد المحاولة لاحقا"
-                    else:
-                        return f"حدث خطأ أثناء الاتصال بالخدمة كود {status}"
+                    print("⚠️ [Safety Block / Empty Response]: تم حجب الرد من السيرفر.")
+                    return "ما أقدر أرد على هالكلام"
+            else:
+                # 4. طباعة جسم الخطأ بالكامل في الـ Console للتشخيص
+                error_body = await response.text()
+                print(f"❌ [API Error {status}]: {error_body}")
+                return in_character_fallback
 
     except asyncio.TimeoutError:
         print("❌ [Timeout Error]: استغرق الطلب وقتاً طويلاً.")
-        return "استغرق التفكير وقتا طويلا"
+        return in_character_fallback
     except Exception as e:
         print(f"❌ [Exception]: {e}")
-        return "حدث خطأ غير متوقع"
+        return in_character_fallback
 
 # ==========================================
-# 3. أحداث ديسكورد (Discord Events)
+# 3. أحداث ديسكورد
 # ==========================================
 @client.event
 async def on_ready():
+    global http_session
+    # إنشاء جلسة HTTP واحدة دائمة لمشروع البوت كاملاً
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+        
     print("=" * 45)
     print(f"✅ تم الاتصال بديسكورد بنجاح!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
@@ -119,41 +133,34 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # تجنب رد البوت على رسائله
-    if message.author == client.user:
+    # 6. منع البوت من الرد على نفسه أو على البوتات الأخرى لمنع الحلقات اللانهائية
+    if message.author.bot:
         return
 
-    # التفاعل عند عمل Mention للبوت فقط
     if client.user in message.mentions:
-        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
+        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "مرحباً"
         user_name = message.author.display_name
-        
-        if not clean_prompt:
-            clean_prompt = "مرحباً"
 
-        print(f"\n📥 [رسالة جديدة من {user_name}]: {clean_prompt}")
+        print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
         
         async with message.channel.typing():
             reply = await ask_ena_brain(clean_prompt, user_name)
-
-            # تجزئة الرسائل إذا كانت أكبر من حد ديسكورد (2000 حرف)
-            if len(reply) > 2000:
-                for i in range(0, len(reply), 1900):
-                    await message.reply(reply[i:i+1900], mention_author=False)
-            else:
-                await message.reply(reply, mention_author=False)
+            await message.reply(reply, mention_author=False)
 
 # ==========================================
 # 4. التشغيل الرئيسي
 # ==========================================
 async def main():
     await start_web_server()
-    await client.start(DISCORD_TOKEN)
+    try:
+        await client.start(DISCORD_TOKEN)
+    finally:
+        # إغلاق جلسة HTTP بنظافة عند إيقاف البوت
+        if http_session and not http_session.closed:
+            await http_session.close()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.")
-    except Exception as e:
-        print(f"❌ خطأ في التشغيل: {e}")
