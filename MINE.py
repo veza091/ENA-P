@@ -34,7 +34,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
 
 # تم جعل اسم النموذج مرناً من البيئة مع افتراض نموذج مستقر
-MODEL_NAME = os.getenv("MODEL_NAME", "gemma-2-27b-it")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemma-3-31b-it")
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
 MAX_OUTPUT_TOKENS = 100    # حد مريح للعربية: لا يبتر الأحرف (UTF-8) أبداً
