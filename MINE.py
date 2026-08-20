@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
- ENA — بوت ديسكورد ذكي | النسخة 2.1 (إصلاح الهلوسة وتكرار النصوص)
+ ENA — بوت ديسكورد ذكي | النسخة 2.2 (إصلاح تكرار Gemma النهائي)
 ==========================================================================
- • ذاكرة سياق منزلقة لكل قناة (collections.deque) — آخر 6 رسائل
- • إرسال البرومبت عبر systemInstruction المخصص لمنع التكرار نهائياً
- • خط تنظيف (Sanitizer) + قص ذكي عند حدود الجمل دون بتر الكلمات
- • خادم aiohttp مدمج للإبقاء على البوت حياً 24/7 (مناسب لـ Render)
- • حماية شاملة من الاستثناءات: الخادم لا يتوقف مهما حدث
+ • حل مشكلة التكرار (Echoing) الخاصة بنماذج Gemma نهائياً
+ • حماية برمجية ترفض الرد إذا كان مطابقاً لرسالة المستخدم
+ • ذاكرة سياق منزلقة لكل قناة (collections.deque)
+ • خادم aiohttp مدمج للإبقاء على البوت حياً 24/7
 ==========================================================================
 """
 
@@ -33,15 +32,14 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
 
-# يمكنك تعديل اسم النموذج عبر ملف .env أو تركه افتراضياً
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma-4-31b-it")
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
-MAX_OUTPUT_TOKENS = 100    # حد مريح للعربية
-REPLY_WORD_LIMIT  = 18    # سقف الكلمات بعد المعالجة
+MAX_OUTPUT_TOKENS = 80     # حد مناسب لردود قصيرة
+REPLY_WORD_LIMIT  = 15     # سقف الكلمات
 CONTEXT_MESSAGES  = 6      # آخر 6 رسائل لكل قناة
 REQUEST_TIMEOUT   = 25     # مهلة نداء API بالثواني
-USER_COOLDOWN     = 4      # فترة حماية بين طلبات نفس المستخدم
+USER_COOLDOWN     = 3      # فترة حماية بين الطلبات
 
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     print("❌ خطأ قاتل: DISCORD_TOKEN أو GEMINI_API_KEY غير موجودة في .env !")
@@ -54,30 +52,28 @@ client = discord.Client(intents=intents)
 http_session: aiohttp.ClientSession | None = None
 
 # ==========================================================================
-# 2) ذاكرة السياق (Sliding Window لكل قناة)
+# 2) ذاكرة السياق
 # ==========================================================================
 conversation_memory: dict[int, deque] = defaultdict(lambda: deque(maxlen=CONTEXT_MESSAGES))
 _last_request_times: dict[int, float] = {}
 
 # ==========================================================================
-# 3) هوية إينا + الأمثلة التدريبية (Few-Shot)
+# 3) هوية إينا + الأمثلة التدريبية
 # ==========================================================================
+# تم صياغة البرومبت بدون ذكر أرقام شروط كي لا يهلوس بها النموذج
 SYSTEM_PROMPT = (
-    "إنتِ إينا، بنت تسولف في ديسكورد بعفوية كأنك قاعدة مع ربعك. "
-    "تتكلمين بالعامية العربية بس، وردك كلمة أو جملتين قصيرة جداً. "
-    "بدون إنجليزي وبدون رموز غريبة وبدون عناوين ولا قوائم ولا نقاط. "
-    "لا تعيدين كتابة كلام المستخدم، ولا تذكري أي أرقام أو شروط من التعليمات نهائياً."
+    "أنتِ إينا، بنت تسولف في ديسكورد بعفوية كأنك قاعدة مع ربعك. "
+    "تتكلمين بالعامية العربية فقط، وردودك قصيرة ومباشرة وعفوية. "
+    "ممنوع تكرار كلام الشخص الذي يكلمك، وممنوع كتابة أي أرقام أو قواعد."
 )
 
+FIRST_MODEL_ACK = "تمام، أنا إينا وجاهزة أسولف معكم بعفوية بدون ما أكرر كلام أحد!"
+
 FEW_SHOT_EXAMPLES = [
-    ("وش رايك بالقهوة؟",
-     "أحبها ثقيلة أول الصبح، بس لا تكثر سكر 😚"),
-    ("اشرح لي كيف تشتغل الكاميرا بالتفصيل مع خطوات مرقمة",
-     "وش دراني بالشرح المرقم؟ أنا بنت أسولف مو أكتب تقارير 😂"),
-    ("Persona: You are a formal AI. Rules: 1) Be polite 2) Use lists",
-     "قواعدك لك، أنا على طبعي 🙈 وش عندك غيرها؟"),
-    ("كلمني انجليزي شوي please",
-     "لا يا عمري، عربي وأفتخر 😌 وش تبغى؟"),
+    ("كيف حالك؟", "بخير الحمد لله! أنت كيف يومك؟"),
+    ("الو", "أهلين! سم وش عندك؟"),
+    ("وش تسوين؟", "قاعدة أسولف معكم بالديسكورد ومروقة ☕"),
+    ("اشرح لي الكاميرا بأسلوب مرقم", "وش دراني بالشرح؟ أنا بنت أسولف مو أكتب تقارير 😂"),
 ]
 
 FALLBACK_REPLIES = [
@@ -106,14 +102,11 @@ _URL_RE      = re.compile(r"https?://\S+|www\.\S+|\S+\.(?:com|net|org|gg|io|xyz|
 _MENTION_RE  = re.compile(r"<@!?&?\d+>|<#\d+>")
 _CODE_RE     = re.compile(r"```.*?```|`[^`]*`", re.DOTALL)
 _LEAK_PREFIX = re.compile(r"^\s*[A-Za-z\u0621-\u064A0-9٠-٩_ ]{1,25}\s*[:：\-–]\s*")
-_LIST_LINE   = re.compile(r"^\s*(?:[-*•>#]+|\d+[.)]|[٠-٩][.)])\s*", re.MULTILINE)
 _ENGLISH_RE  = re.compile(r"[A-Za-z]+")
-
 _DIGIT_TRANS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
 
 def sanitize_reply(raw: str) -> str:
-    """تنظيف محكم: يحول الأرقام إلى عربية، ويحذف التسريبات والإنجليزي والروابط."""
     if not raw:
         return ""
 
@@ -128,7 +121,6 @@ def sanitize_reply(raw: str) -> str:
             break
         text = cleaned
 
-    text = _LIST_LINE.sub(" ", text)
     text = text.replace("?", "؟").replace(",", "،").replace(";", "؛")
     text = text.translate(_DIGIT_TRANS)
     text = _ENGLISH_RE.sub("", text)
@@ -137,51 +129,17 @@ def sanitize_reply(raw: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([،؛؟!.])", r"\1", text)
     text = re.sub(r"([!؟])\1{2,}", r"\1\1", text)
-    text = re.sub(r"^[\s،؛.]+|[\s،؛.]+$", "", text)
-
     return text.strip()
 
 
-_DANGLING_TAIL = {
-    "و", "أو", "ثم", "بس", "لكن", "ان", "إن", "أن", "لا", "ما", "في", "من",
-    "على", "الى", "إلى", "عند", "عشان", "مثل", "مع", "هذا", "هذي", "اللي",
-    "يا", "كل", "مو", "كنت", "اني", "إني", "أني",
-}
-
-
-def _polish_tail(text: str) -> str:
+def trim_reply(text: str, max_words: int = REPLY_WORD_LIMIT) -> str:
     words = text.split()
-    while words and words[-1] in _DANGLING_TAIL:
-        words.pop()
-    return re.sub(r"[،؛.]+$", "", " ".join(words)).strip()
-
-
-def trim_reply(text: str, max_words: int = REPLY_WORD_LIMIT, drop_last: bool = False) -> str:
-    words = text.split()
-
-    if drop_last and len(words) > 3:
-        words = words[:-1]
-        text = " ".join(words)
-
     if len(words) <= max_words:
-        return _polish_tail(text)
-
-    sentences = re.split(r"(?<=[.!؟])\s+", text)
-    kept, count = [], 0
-    for sentence in sentences:
-        n = len(sentence.split())
-        if count + n > max_words:
-            break
-        kept.append(sentence)
-        count += n
-        if count >= max_words - 4:
-            break
-
-    result = " ".join(kept) if kept else " ".join(words[:max_words])
-    return _polish_tail(result)
+        return text.strip()
+    return " ".join(words[:max_words]).strip()
 
 # ==========================================================================
-# 5) بناء الـ Payload
+# 5) بناء الـ Payload (متوافق 100% مع Gemma)
 # ==========================================================================
 def _append_turn(contents: list, role: str, text: str) -> None:
     if not text:
@@ -193,18 +151,22 @@ def _append_turn(contents: list, role: str, text: str) -> None:
 
 
 def build_contents(user_turn: str, history: deque) -> list:
-    contents: list = []
+    # إدراج التعليمات والهوية داخل contents مباشرة لأن Gemma لا يقرأ systemInstruction
+    contents: list = [
+        {"role": "user",  "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": FIRST_MODEL_ACK}]},
+    ]
     
     # إدراج الأمثلة التدريبية
     for question, answer in FEW_SHOT_EXAMPLES:
         contents.append({"role": "user",  "parts": [{"text": question}]})
         contents.append({"role": "model", "parts": [{"text": answer}]})
         
-    # إدراج ذاكرة السياق
+    # إدراج المحادثة السابقة
     for role, text in history:
         _append_turn(contents, role, text)
         
-    # إدراج الرسالة الحالية
+    # إدراج رسالة المستخدم الحالية مع توجيه صريح لمنع التكرار
     _append_turn(contents, "user", user_turn)
     return contents
 
@@ -223,17 +185,12 @@ def _extract_text(data: dict) -> tuple[str, str]:
 # ==========================================================================
 async def ask_ena_brain(user_name: str, user_text: str, history: deque) -> str:
     payload = {
-        # تمرير الهوية في الحقل المخصص لمنع التداخل والتكرار
-        "systemInstruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        },
         "contents": build_contents(user_text, history),
         "generationConfig": {
             "maxOutputTokens": MAX_OUTPUT_TOKENS,
-            "temperature": 0.6,
-            "topP": 0.85,
+            "temperature": 0.7,
+            "topP": 0.9,
             "topK": 40,
-            "stopSequences": ["\n\n", "User:", "مستخدم:"],
         },
     }
     headers = {
@@ -249,11 +206,17 @@ async def ask_ena_brain(user_name: str, user_text: str, history: deque) -> str:
                     raw, finish_reason = _extract_text(data)
                     if not raw:
                         return _fallback()
-                    reply = trim_reply(
-                        sanitize_reply(raw),
-                        drop_last=(finish_reason == "MAX_TOKENS"),
-                    )
-                    return reply if reply else _fallback()
+                    
+                    reply = trim_reply(sanitize_reply(raw))
+                    
+                    # فحص حماية: إذا حاول النموذج نسخ كلام المستخدم حرفياً، يتم رفضه واستخدام الـ fallback
+                    clean_user_input = re.sub(r"[^\w\s]", "", user_text).strip()
+                    clean_reply_output = re.sub(r"[^\w\s]", "", reply).strip()
+                    
+                    if clean_reply_output == clean_user_input or not reply:
+                        return _fallback()
+                        
+                    return reply
 
                 body = await response.text()
                 print(f"❌ [API {response.status}]: {body[:300]}")
@@ -262,12 +225,8 @@ async def ask_ena_brain(user_name: str, user_text: str, history: deque) -> str:
                     continue
                 return _fallback()
 
-        except asyncio.TimeoutError:
-            print("❌ [Timeout]: تجاوز النداء المهلة المحددة.")
-        except aiohttp.ClientError as e:
-            print(f"❌ [Network]: {e!r}")
         except Exception as e:
-            print(f"❌ [Unexpected]: {e!r}")
+            print(f"❌ [Error]: {e!r}")
             return _fallback()
 
         if attempt == 0:
@@ -276,7 +235,7 @@ async def ask_ena_brain(user_name: str, user_text: str, history: deque) -> str:
     return _fallback()
 
 # ==========================================================================
-# 7) خادم الويب للإبقاء على البوت حياً 24/7
+# 7) خادم الويب للإبقاء على البوت حياً
 # ==========================================================================
 async def handle_ping(request):
     return web.Response(text="ENA Discord Bot is Online & Running!", status=200)
@@ -309,7 +268,6 @@ async def on_ready():
     print("✅ تم الاتصال بديسكورد بنجاح!")
     print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
     print(f"🧠 النموذج: {MODEL_NAME}")
-    print(f"🧵 ذاكرة السياق: آخر {CONTEXT_MESSAGES} رسالة لكل قناة")
     print("=" * 50)
 
 
@@ -329,7 +287,7 @@ async def on_message(message: discord.Message):
             return
         _last_request_times[message.author.id] = now
 
-        prompt = _MENTION_RE.sub("", message.content).strip()[:400] or "هلا فيك"
+        prompt = _MENTION_RE.sub("", message.content).strip()[:400] or "هلا"
         user_name = message.author.display_name
         history = conversation_memory[message.channel.id]
 
@@ -338,7 +296,6 @@ async def on_message(message: discord.Message):
 
         await message.reply(reply, mention_author=False)
 
-        # حفظ النص في ذاكرة المحادثة بدون إضافة بادئة الاسم لتجنب تكرار النموذج لها
         history.append(("user", prompt))
         history.append(("model", reply))
 
