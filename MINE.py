@@ -20,7 +20,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# قائمة النماذج المجانية المتاحة مرتبة بحسب الأفضلية والسعة للتنقل الآلي
 FREE_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
@@ -29,8 +28,8 @@ FREE_MODELS = [
     "gemini-2.5-flash-lite"
 ]
 
-# ذاكرة حفظ آخر 6 رسائل لكل قناة
-chat_histories = {}
+# الذاكرة قصيرة المدى (مقسمة حسب القناة والمستخدم: (channel_id, user_id))
+user_chat_histories = {}
 
 # ==========================================
 # 1. خادم الويب
@@ -49,10 +48,9 @@ async def start_web_server():
     print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بـ Gemini API مع الذاكرة والتبديل التلقائي
+# 2. الاتصال بـ Gemini API مع ذاكرة قصيرة لكل مستخدم
 # ==========================================
-async def ask_ena_brain(channel_id, prompt, user_name):
-    # توجيهات واقعية تمنع تكرار اسم المدينة أو إقحام الهوية في الحوار العابر
+async def ask_ena_brain(channel_id, user_id, prompt, user_name):
     system_instruction = (
         "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد بعفوية واقعية تامة كأي مستخدم عادي. "
         "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
@@ -65,14 +63,17 @@ async def ask_ena_brain(channel_id, prompt, user_name):
         "5. ممنوع الاعتراف بأنك ذكاء اصطناعي أو بوت."
     )
 
-    if channel_id not in chat_histories:
-        chat_histories[channel_id] = deque(maxlen=6)
+    # مفتاح الذاكرة الخاص بكل مستخدم داخل كل قناة
+    history_key = (channel_id, user_id)
+
+    if history_key not in user_chat_histories:
+        user_chat_histories[history_key] = deque(maxlen=6)
         
-    history = list(chat_histories[channel_id])
-    history_text = "\n".join(history) if history else "لا يوجد سياق سابق."
+    history = list(user_chat_histories[history_key])
+    history_text = "\n".join(history) if history else "لا يوجد سياق سابق مع هذا المستخدم."
 
     full_prompt = (
-        f"--- سياق المحادثة السابقة ---\n{history_text}\n\n"
+        f"--- سياق المحادثة السابقة مع {user_name} ---\n{history_text}\n\n"
         f"--- الرسالة الجديدة ---\nالمرسل ({user_name}): {prompt}"
     )
 
@@ -82,7 +83,6 @@ async def ask_ena_brain(channel_id, prompt, user_name):
         "generationConfig": {"maxOutputTokens": 60, "temperature": 0.3, "topP": 0.8}
     }
     
-    # تجربة النماذج المتاحة بالترتيب عند نفاذ الحد أو وجود ضغط (Fallback Mechanism)
     async with aiohttp.ClientSession() as session:
         for model in FREE_MODELS:
             gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
@@ -102,9 +102,9 @@ async def ask_ena_brain(channel_id, prompt, user_name):
                         reply = re.sub(r'\s+', ' ', reply).strip()
                         
                         if reply:
-                            # تحديث الذاكرة بالرسالة والرد
-                            chat_histories[channel_id].append(f"{user_name}: {prompt}")
-                            chat_histories[channel_id].append(f"إينا: {reply}")
+                            # تحديث الذاكرة الخاصة بالمستخدم المحدّد
+                            user_chat_histories[history_key].append(f"{user_name}: {prompt}")
+                            user_chat_histories[history_key].append(f"إينا: {reply}")
                             return reply
                     elif resp.status in (429, 404, 503):
                         print(f"⚠️ النموذج {model} وصل للحد أو غير متاح ({resp.status})، جاري التبديل للنموذج التالي...")
@@ -120,7 +120,7 @@ async def ask_ena_brain(channel_id, prompt, user_name):
 # ==========================================
 @client.event
 async def on_ready():
-    print(f"✅ تم الاتصال: {client.user} | تم تعديل توجيهات الواقعية لمنع التكرار")
+    print(f"✅ تم الاتصال: {client.user} | الذاكرة قصيرة المدى مفصولة حسب المستخدم")
 
 @client.event
 async def on_message(message):
@@ -131,11 +131,12 @@ async def on_message(message):
     if client.user in message.mentions or is_dm:
         clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "مرحباً"
         user_name = message.author.display_name
+        user_id = message.author.id
 
-        print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
+        print(f"\n📥 [رسالة من {user_name} ({user_id})]: {clean_prompt}")
 
         async with message.channel.typing():
-            reply = await ask_ena_brain(message.channel.id, clean_prompt, user_name)
+            reply = await ask_ena_brain(message.channel.id, user_id, clean_prompt, user_name)
             await message.reply(reply[:2000], mention_author=False)
 
 async def main():
