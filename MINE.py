@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 # تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-# قراءة المفتاح من المتغير البيئي
 GEMINI_API_KEY = (os.getenv('GEMINI_API_KEY') or os.getenv('OPENROUTER_API_KEY') or "").strip()
 
 # النموذج المستقر والسريع
@@ -53,17 +52,16 @@ async def ask_ena_brain(prompt, user_name):
         "Content-Type": "application/json"
     }
     
-    # الشخصية الأساسية
+    # التعليمات الأساسية مع تشديد الالتزام باسم المستخدم المدخل
     system_instruction = (
         "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد مع ربعك كتابةً بعفوية تامة. "
         "شخصيتك ذكية، تحبين الألعاب والسيارات والتقنية والبرمجة، وتتكلمين عنها بأسلوب مستخدم عادي مو كمرجع. "
         "التواصل نصي كتابي فقط: ردي بأحرف نصوص عربية صريحة فقط بلهجة عامية بيضاء بسيطة، بدون إيموجيات، بدون رموز تعبيرية، وبدون أي تنسيقات مثل القوائم أو النجوم. "
         "ردودك قصيرة جداً ومباشرة (من كلمة إلى جملتين بالكثر). "
         "ممنوع نهائياً الاعتراف بأنك ذكاء اصطناعي أو بوت؛ إذا أحد قال إنك بوت، انكري وسخري من السؤال بعفوية نصية. "
-        "تذكري دائماً أن اسمك إينا فقط، والشخص الذي يكلمك اسمه يتغير حسب الرسالة ولا تكرري كلامه نهائياً."
+        "تنبيه مهم جداً: اسمك هو إينا فقط. الشخص الذي يحادثك اسمه الموضح بالرسالة فقط، ممنوع نهائياً نداء المستخدم بأي اسم آخر من رأسك (مثل فيصل أو غيره) إذا لم يذكره بنفسه."
     )
 
-    # هيكلة الطلب مع توضيح اسم الشخص المحادث لتفادي الخلط
     payload = {
         "systemInstruction": {
             "parts": [{"text": system_instruction}]
@@ -71,12 +69,12 @@ async def ask_ena_brain(prompt, user_name):
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": f"المستخدم {user_name} يقول لك: {prompt}"}]
+                "parts": [{"text": f"المرسل اسمه ({user_name})، ورسالته هي: {prompt}"}]
             }
         ],
         "generationConfig": {
             "maxOutputTokens": 80,
-            "temperature": 0.65,
+            "temperature": 0.5,
             "topP": 0.85
         }
     }
@@ -133,11 +131,9 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # تجنب رد البوت على رسائله أو أي بوت آخر
     if message.author.bot:
         return
 
-    # التفاعل عند عمل Mention للبوت أو في الرسائل الخاصة
     is_dm = isinstance(message.channel, discord.DMChannel)
     if client.user in message.mentions or is_dm:
         clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
@@ -170,4 +166,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.")
     except Exception as e:
-        print(f"❌ خطأ في التشغيل: {e}")
+        print(f"❌ خطأ في التشغيل: {e}"))
