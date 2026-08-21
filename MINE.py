@@ -166,4 +166,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.")
     except Exception as e:
-        print(f"❌ خطأ في التشغيل: {e}"))
+        print(f"❌ خطأ في التشغيل: {e}")
