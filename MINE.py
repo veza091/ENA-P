@@ -7,29 +7,24 @@ import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 
-# تحميل المتغيرات البيئية
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = (os.getenv('GEMINI_API_KEY') or os.getenv('OPENROUTER_API_KEY') or "").strip()
-
-# النموذج المستقر والسريع
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite")
 
-# التثبت السريع من ضبط المتغيرات
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
-    print("❌ خطأ قاتل: لم يتم العثور على DISCORD_TOKEN أو المفتاح في .env!")
+    print("❌ خطأ: لم يتم العثور على DISCORD_TOKEN أو المفتاح في .env!")
     sys.exit(1)
 
-# إعداد صلاحيات البوت في ديسكورد
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
 # ==========================================
-# 1. خادم الويب الوهمي (لإبقاء الخدمة تعمل 24/7)
+# 1. خادم الويب
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="ENA Discord Bot is Online & Running!", status=200)
+    return web.Response(text="ENA Bot is Online!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -38,96 +33,62 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 [Web Server] الخادم يعمل بنجاح على المنفذ: {port}")
+    await web.TCPSite(runner, '0.0.0.0', port).start()
+    print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
 
 # ==========================================
-# 2. الاتصال بعقل ENA (Google Gemini Flash Lite API)
+# 2. الاتصال بـ Gemini API
 # ==========================================
 async def ask_ena_brain(prompt, user_name):
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
     
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
-    # التعليمات الأساسية مع تشديد الالتزام باسم المستخدم المدخل
     system_instruction = (
         "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد مع ربعك كتابةً بعفوية تامة. "
         "شخصيتك ذكية، تحبين الألعاب والسيارات والتقنية والبرمجة، وتتكلمين عنها بأسلوب مستخدم عادي مو كمرجع. "
-        "التواصل نصي كتابي فقط: ردي بأحرف نصوص عربية صريحة فقط بلهجة عامية بيضاء بسيطة، بدون إيموجيات، بدون رموز تعبيرية، وبدون أي تنسيقات مثل القوائم أو النجوم. "
+        "التواصل نصي كتابي فقط: ردي بأحرف نصوص عربية صريحة فقط بلهجة عامية بيضاء بسيطة، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات مثل القوائم أو النجوم. "
         "ردودك قصيرة جداً ومباشرة (من كلمة إلى جملتين بالكثر). "
         "ممنوع نهائياً الاعتراف بأنك ذكاء اصطناعي أو بوت؛ إذا أحد قال إنك بوت، انكري وسخري من السؤال بعفوية نصية. "
-        "تنبيه مهم جداً: اسمك هو إينا فقط. الشخص الذي يحادثك اسمه الموضح بالرسالة فقط، ممنوع نهائياً نداء المستخدم بأي اسم آخر من رأسك (مثل فيصل أو غيره) إذا لم يذكره بنفسه."
+        "تنبيه مهم جداً: اسمك هو إينا فقط. الشخص الذي يحادثك اسمه الموضح بالرسالة فقط، ممنوع نهائياً نداء المستخدم بأي اسم آخر من رأسك إذا لم يذكره بنفسه."
     )
 
     payload = {
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": f"المرسل اسمه ({user_name})، ورسالته هي: {prompt}"}]
-            }
-        ],
-        "generationConfig": {
-            "maxOutputTokens": 80,
-            "temperature": 0.5,
-            "topP": 0.85
-        }
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": f"المرسل اسمه ({user_name})، ورسالته هي: {prompt}"}]}],
+        "generationConfig": {"maxOutputTokens": 80, "temperature": 0.5, "topP": 0.85}
     }
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(gemini_url, json=payload, headers=headers, timeout=25) as response:
-                status = response.status
-                
-                if status == 200:
-                    data = await response.json()
+            async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=25) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
                     candidates = data.get('candidates', [])
                     if not candidates:
                         return "هلا فيك"
                         
                     parts = candidates[0].get('content', {}).get('parts', [])
-                    reply = "".join(part.get('text', '') for part in parts).strip()
+                    reply = "".join(p.get('text', '') for p in parts).strip()
                     
-                    # فلترة سريعة لإزالة الأحرف الإنجليزية وعلامات الترقيم
-                    reply = re.sub(r'[A-Za-z0-9_]', '', reply)
-                    reply = re.sub(r'[.,،؛!؟:\-_•\*]', ' ', reply)
+                    # دمج الفلترة في خطوة واحدة
+                    reply = re.sub(r'[A-Za-z0-9_.,،؛!؟:\-_•\*]', ' ', reply)
                     reply = re.sub(r'\s+', ' ', reply).strip()
-                    
                     return reply if reply else "هلا فيك"
-                else:
-                    response_text = await response.text()
-                    print(f"❌ [API Error {status}]: {response_text[:300]}")
-                    if status == 400:
-                        return "حدث خطأ في طلب الخدمة يرجى التأكد من المفتاح"
-                    elif status == 404:
-                        return "النموذج غير متاح حاول التأكد من اسم MODEL_NAME"
-                    elif status == 429:
-                        return "النت ثقيل شوي عندي لحظة وأرجع لك"
-                    else:
-                        return "فصل النت عندي لحظة"
+                
+                print(f"❌ [API Error {resp.status}]")
+                return "النت ثقيل شوي عندي لحظة" if resp.status == 429 else "فصل النت عندي لحظة"
 
     except asyncio.TimeoutError:
-        print("❌ [Timeout Error]: استغرق الطلب وقتاً طويلاً.")
         return "استغرق التفكير وقتا طويلا"
     except Exception as e:
         print(f"❌ [Exception]: {e}")
         return "حدث خطأ غير متوقع"
 
 # ==========================================
-# 3. أحداث ديسكورد (Discord Events)
+# 3. أحداث ديسكورد والتشغيل
 # ==========================================
 @client.event
 async def on_ready():
-    print("=" * 45)
-    print(f"✅ تم الاتصال بديسكورد بنجاح!")
-    print(f"🤖 البوت: {client.user} (ID: {client.user.id})")
-    print(f"🧠 النموذج: {MODEL_NAME}")
-    print("=" * 45)
+    print(f"✅ تم الاتصال: {client.user} | النموذج: {MODEL_NAME}")
 
 @client.event
 async def on_message(message):
@@ -136,26 +97,15 @@ async def on_message(message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     if client.user in message.mentions or is_dm:
-        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip()
+        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "مرحباً"
         user_name = message.author.display_name
-        
-        if not clean_prompt:
-            clean_prompt = "مرحباً"
 
-        print(f"\n📥 [رسالة جديدة من {user_name}]: {clean_prompt}")
-        
+        print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
+
         async with message.channel.typing():
             reply = await ask_ena_brain(clean_prompt, user_name)
+            await message.reply(reply[:2000], mention_author=False)
 
-            if len(reply) > 2000:
-                for i in range(0, len(reply), 1900):
-                    await message.reply(reply[i:i+1900], mention_author=False)
-            else:
-                await message.reply(reply, mention_author=False)
-
-# ==========================================
-# 4. التشغيل الرئيسي
-# ==========================================
 async def main():
     await start_web_server()
     await client.start(DISCORD_TOKEN)
@@ -165,5 +115,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.")
-    except Exception as e:
-        print(f"❌ خطأ في التشغيل: {e}")
