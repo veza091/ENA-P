@@ -16,7 +16,7 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
 if not DISCORD_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ خطأ: لم يتم العثور على كافة المتغيرات المطلوبة (DISCORD_TOKEN, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY) في .env!")
+    print("❌ خطأ: لم يتم العثور على كافة المتغيرات المطلوبة في .env!")
     sys.exit(1)
 
 # الاتصال بقاعدة بيانات Supabase
@@ -34,7 +34,6 @@ FREE_MODELS = [
     "gemini-2.5-flash-lite"
 ]
 
-# تتبع مهام مؤقت الخمول (15 دقيقة) لكل مستخدم
 inactivity_tasks = {}
 
 # ==========================================
@@ -43,47 +42,49 @@ inactivity_tasks = {}
 def save_message_cloud(channel_id, user_id, user_name, role, content):
     try:
         now_str = datetime.now(timezone.utc).isoformat()
+        c_id = str(channel_id)
+        u_id = str(user_id)
         
         # 1. إدخال الرسالة في جدول المحادثات
         supabase.table('conversations').insert({
-            'channel_id': str(channel_id),
-            'user_id': str(user_id),
+            'channel_id': c_id,
+            'user_id': u_id,
             'user_name': user_name,
             'role': role,
             'content': content
         }).execute()
         
         # 2. تحديث العداد ووقت النشاط
-        profile = supabase.table('user_profiles').select('msg_count').eq('user_id', str(user_id)).execute()
+        profile = supabase.table('user_profiles').select('msg_count').eq('user_id', u_id).execute()
         if profile.data:
             current_count = profile.data[0]['msg_count'] + 1
             supabase.table('user_profiles').update({
                 'msg_count': current_count,
                 'user_name': user_name,
                 'last_active': now_str
-            }).eq('user_id', str(user_id)).execute()
+            }).eq('user_id', u_id).execute()
         else:
             current_count = 1
             supabase.table('user_profiles').insert({
-                'user_id': str(user_id),
+                'user_id': u_id,
                 'user_name': user_name,
                 'summary': '',
                 'msg_count': 1,
                 'last_active': now_str
             }).execute()
             
+        print(f"💾 [Supabase] تم حفظ رسالة ({role}) للمستخدم {user_name}")
         return current_count
     except Exception as e:
-        print(f"❌ خطأ في حفظ الرسالة بـ Supabase: {e}")
+        print(f"❌ خطأ في حفظ الرسالة بـ Supabase التفصيلي: {e}")
         return 0
 
 def get_recent_history_cloud(channel_id, user_id, limit=8):
-    """جلب أحدث الرسائل للذاكرة قصيرة المدى"""
     try:
-        query = supabase.table('conversations').select('role, content').eq('user_id', str(user_id))
+        u_id = str(user_id)
+        query = supabase.table('conversations').select('role, content').eq('user_id', u_id)
         
-        # تصفية حسب القناة فقط إن لم تكن 0
-        if channel_id != 0:
+        if str(channel_id) != "0":
             query = query.eq('channel_id', str(channel_id))
             
         res = query.order('id', desc=True).limit(limit).execute()
@@ -98,7 +99,6 @@ def get_recent_history_cloud(channel_id, user_id, limit=8):
         return []
 
 def get_user_profile_cloud(user_id):
-    """جلب الذاكرة طويلة المدى والعداد"""
     try:
         res = supabase.table('user_profiles').select('summary, msg_count').eq('user_id', str(user_id)).execute()
         if res.data:
@@ -112,7 +112,6 @@ def get_user_profile_cloud(user_id):
 # 1. التلخيص السحابي وقانون الإحلال
 # ==========================================
 async def summarize_and_consolidate_memory(user_id, user_name):
-    """مهمة خلفية لتلخيص واستبدال الذاكرة طويلة المدى"""
     try:
         current_summary, _ = get_user_profile_cloud(user_id)
         recent_history = get_recent_history_cloud(0, user_id, limit=20)
@@ -147,7 +146,6 @@ async def summarize_and_consolidate_memory(user_id, user_name):
                             candidates = data.get('candidates', [])
                             if candidates:
                                 new_summary = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
-                                
                                 supabase.table('user_profiles').update({'summary': new_summary, 'msg_count': 0}).eq('user_id', str(user_id)).execute()
                                 print(f"☁️ [Supabase] تم تحديث وإحلال ذاكرة المستخدم: {user_name}")
                                 break
@@ -158,7 +156,6 @@ async def summarize_and_consolidate_memory(user_id, user_name):
         print(f"❌ خطأ عام في عملية التلخيص: {e}")
 
 async def schedule_inactivity_summary(user_id, user_name, delay_seconds=900):
-    """مؤقت الخمول (15 دقيقة) لتلخيص السالفة بعد توقف المحادثة"""
     try:
         await asyncio.sleep(delay_seconds)
         print(f"⏱️ [مؤقت الخمول] مرّت 15 دقيقة صمت. جاري تحديث ذاكرة {user_name}...")
@@ -187,6 +184,9 @@ async def start_web_server():
 # ==========================================
 async def ask_ena_brain(channel_id, user_id, prompt, user_name):
     try:
+        # حفظ رسالة المستخدم أولاً في قاعدة البيانات
+        save_message_cloud(channel_id, user_id, user_name, user_name, prompt)
+
         long_term_memory, msg_count = get_user_profile_cloud(user_id)
 
         system_instruction = (
@@ -234,12 +234,10 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                             parts = candidates[0].get('content', {}).get('parts', [])
                             reply = "".join(p.get('text', '') for p in parts).strip()
                             
-                            # تنظيف الرموز غير المرغوب بها دون مسح الحروف العربية
                             reply = re.sub(r'[\*\-_•#@\$%\^&\(\)]', '', reply)
                             reply = re.sub(r'\s+', ' ', reply).strip()
                             
                             if reply:
-                                save_message_cloud(channel_id, user_id, user_name, user_name, prompt)
                                 current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
                                 reply_text = reply
 
