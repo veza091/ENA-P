@@ -41,107 +41,121 @@ inactivity_tasks = {}
 # 0. التعامل مع Supabase (حفظ وجلب البيانات)
 # ==========================================
 def save_message_cloud(channel_id, user_id, user_name, role, content):
-    now_str = datetime.now(timezone.utc).isoformat()
-    
-    # 1. إدخال الرسالة في جدول المحادثات
-    supabase.table('conversations').insert({
-        'channel_id': channel_id,
-        'user_id': user_id,
-        'user_name': user_name,
-        'role': role,
-        'content': content
-    }).execute()
-    
-    # 2. تحديث العداد ووقت النشاط
-    profile = supabase.table('user_profiles').select('msg_count').eq('user_id', user_id).execute()
-    if profile.data:
-        current_count = profile.data[0]['msg_count'] + 1
-        supabase.table('user_profiles').update({
-            'msg_count': current_count,
+    try:
+        now_str = datetime.now(timezone.utc).isoformat()
+        
+        # 1. إدخال الرسالة في جدول المحادثات
+        supabase.table('conversations').insert({
+            'channel_id': str(channel_id),
+            'user_id': str(user_id),
             'user_name': user_name,
-            'last_active': now_str
-        }).eq('user_id', user_id).execute()
-    else:
-        current_count = 1
-        supabase.table('user_profiles').insert({
-            'user_id': user_id,
-            'user_name': user_name,
-            'summary': '',
-            'msg_count': 1,
-            'last_active': now_str
+            'role': role,
+            'content': content
         }).execute()
         
-    return current_count
+        # 2. تحديث العداد ووقت النشاط
+        profile = supabase.table('user_profiles').select('msg_count').eq('user_id', str(user_id)).execute()
+        if profile.data:
+            current_count = profile.data[0]['msg_count'] + 1
+            supabase.table('user_profiles').update({
+                'msg_count': current_count,
+                'user_name': user_name,
+                'last_active': now_str
+            }).eq('user_id', str(user_id)).execute()
+        else:
+            current_count = 1
+            supabase.table('user_profiles').insert({
+                'user_id': str(user_id),
+                'user_name': user_name,
+                'summary': '',
+                'msg_count': 1,
+                'last_active': now_str
+            }).execute()
+            
+        return current_count
+    except Exception as e:
+        print(f"❌ خطأ في حفظ الرسالة بـ Supabase: {e}")
+        return 0
 
 def get_recent_history_cloud(channel_id, user_id, limit=8):
-    """جلب أحدث 8 رسائل للذاكرة قصيرة المدى"""
-    res = supabase.table('conversations') \
-        .select('role, content') \
-        .eq('channel_id', channel_id) \
-        .eq('user_id', user_id) \
-        .order('id', desc=True) \
-        .limit(limit) \
-        .execute()
-    
-    rows = res.data or []
-    history = []
-    for row in reversed(rows):
-        history.append(f"{row['role']}: {row['content']}")
-    return history
+    """جلب أحدث الرسائل للذاكرة قصيرة المدى"""
+    try:
+        query = supabase.table('conversations').select('role, content').eq('user_id', str(user_id))
+        
+        # تصفية حسب القناة فقط إن لم تكن 0
+        if channel_id != 0:
+            query = query.eq('channel_id', str(channel_id))
+            
+        res = query.order('id', desc=True).limit(limit).execute()
+        
+        rows = res.data or []
+        history = []
+        for row in reversed(rows):
+            history.append(f"{row['role']}: {row['content']}")
+        return history
+    except Exception as e:
+        print(f"❌ خطأ في get_recent_history_cloud: {e}")
+        return []
 
 def get_user_profile_cloud(user_id):
     """جلب الذاكرة طويلة المدى والعداد"""
-    res = supabase.table('user_profiles').select('summary, msg_count').eq('user_id', user_id).execute()
-    if res.data:
-        return res.data[0]['summary'], res.data[0]['msg_count']
-    return "", 0
+    try:
+        res = supabase.table('user_profiles').select('summary, msg_count').eq('user_id', str(user_id)).execute()
+        if res.data:
+            return res.data[0]['summary'], res.data[0]['msg_count']
+        return "", 0
+    except Exception as e:
+        print(f"❌ خطأ في get_user_profile_cloud: {e}")
+        return "", 0
 
 # ==========================================
 # 1. التلخيص السحابي وقانون الإحلال
 # ==========================================
 async def summarize_and_consolidate_memory(user_id, user_name):
     """مهمة خلفية لتلخيص واستبدال الذاكرة طويلة المدى"""
-    current_summary, _ = get_user_profile_cloud(user_id)
-    recent_history = get_recent_history_cloud(0, user_id, limit=20)
-    if not recent_history:
-        return
-        
-    history_text = "\n".join(recent_history)
+    try:
+        current_summary, _ = get_user_profile_cloud(user_id)
+        recent_history = get_recent_history_cloud(0, user_id, limit=20)
+        if not recent_history:
+            return
+            
+        history_text = "\n".join(recent_history)
 
-    prompt_summary = (
-        f"المطلوب: قم بتحديث وتنظيف ملف الشخصية للمستخدم ({user_name}).\n\n"
-        f"الملخص الحالي في الذاكرة طويلة المدى:\n{current_summary if current_summary else 'لا يوجد'}\n\n"
-        f"المحادثات الأخيرة:\n{history_text}\n\n"
-        "قواعد التحديث والإحلال البشرية:\n"
-        "1. **الإحلال والاستبدال:** إذا ظهرت معلومة جديدة انسجامية تتناقض مع حقيقة قديمة، احذف القديمة واستبدلها فوراً بالحديثة.\n"
-        "2. **حذف التفاصيل اللحظية:** امسح أي مواقف أو أحداث عابرة انتهت ولا أهمية لها مستقبلاً.\n"
-        "3. **الهيكل المطلوب:** رتب الملف البشري في 4 محاور (الهوية الأساسية، الاهتمامات، الطباع، الحقائق القائمة).\n"
-        "4. اكتب النتيجة بشكل نقاط مكثفة ومختصرة جداً دون تكرار."
-    )
+        prompt_summary = (
+            f"المطلوب: قم بتحديث وتنظيف ملف الشخصية للمستخدم ({user_name}).\n\n"
+            f"الملخص الحالي في الذاكرة طويلة المدى:\n{current_summary if current_summary else 'لا يوجد'}\n\n"
+            f"المحادثات الأخيرة:\n{history_text}\n\n"
+            "قواعد التحديث والإحلال البشرية:\n"
+            "1. **الإحلال والاستبدال:** إذا ظهرت معلومة جديدة انسجامية تتناقض مع حقيقة قديمة، احذف القديمة واستبدلها فوراً بالحديثة.\n"
+            "2. **حذف التفاصيل اللحظية:** امسح أي مواقف أو أحداث عابرة انتهت ولا أهمية لها مستقبلاً.\n"
+            "3. **الهيكل المطلوب:** رتب الملف البشري في 4 محاور (الهوية الأساسية، الاهتمامات، الطباع، الحقائق القائمة).\n"
+            "4. اكتب النتيجة بشكل نقاط مكثفة ومختصرة جداً دون تكرار."
+        )
 
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt_summary}]}],
-        "generationConfig": {"maxOutputTokens": 180, "temperature": 0.2}
-    }
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt_summary}]}],
+            "generationConfig": {"maxOutputTokens": 180, "temperature": 0.2}
+        }
 
-    async with aiohttp.ClientSession() as session:
-        for model in FREE_MODELS:
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            try:
-                async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get('candidates', [])
-                        if candidates:
-                            new_summary = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
-                            
-                            # تحديث الملخص في السحابة وتصفير العداد
-                            supabase.table('user_profiles').update({'summary': new_summary, 'msg_count': 0}).eq('user_id', user_id).execute()
-                            print(f"☁️ [Supabase] تم تحديث وإحلال ذاكرة المستخدم: {user_name}")
-                            break
-            except Exception as e:
-                print(f"⚠️ خطأ أثناء تحديث الذاكرة: {e}")
-                continue
+        async with aiohttp.ClientSession() as session:
+            for model in FREE_MODELS:
+                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                try:
+                    async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            candidates = data.get('candidates', [])
+                            if candidates:
+                                new_summary = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
+                                
+                                supabase.table('user_profiles').update({'summary': new_summary, 'msg_count': 0}).eq('user_id', str(user_id)).execute()
+                                print(f"☁️ [Supabase] تم تحديث وإحلال ذاكرة المستخدم: {user_name}")
+                                break
+                except Exception as e:
+                    print(f"⚠️ خطأ أثناء تحديث الذاكرة نموذج {model}: {e}")
+                    continue
+    except Exception as e:
+        print(f"❌ خطأ عام في عملية التلخيص: {e}")
 
 async def schedule_inactivity_summary(user_id, user_name, delay_seconds=900):
     """مؤقت الخمول (15 دقيقة) لتلخيص السالفة بعد توقف المحادثة"""
@@ -172,84 +186,83 @@ async def start_web_server():
 # 3. الاتصال بـ Gemini API مع جلب الذاكرة
 # ==========================================
 async def ask_ena_brain(channel_id, user_id, prompt, user_name):
-    long_term_memory, msg_count = get_user_profile_cloud(user_id)
+    try:
+        long_term_memory, msg_count = get_user_profile_cloud(user_id)
 
-    system_instruction = (
-        "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد بعفوية واقعية تامة كأي مستخدم عادي. "
-        "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
-        "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n"
-        "قواعد الواقعية الصارمة:\n"
-        "1. ممنوع كلياً ذكر اسم مدينتك (الدمام) أو إقحامها في السوالف العادية، اذكريه فقط إذا سُئلتِ مباشرة: من أي مدينة أنتِ؟\n"
-        "2. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة (مثل: متابعة مسلسل، تصفح الجوال، طلب أكل، نوم، طفش عادي) وبدون حركات تصنع أو رسمية.\n"
-        "3. اقرئي السياق وركزي على آخر رسالة فقط بأسلوب متناسق وبدون فلسفة.\n"
-        "4. لا تختلقي قصصاً أو أعمالاً وهمية.\n"
-        "5. ممنوع الاعتراف بأنك ذكاء اصطناعي أو بوت.\n"
-    )
+        system_instruction = (
+            "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد بعفوية واقعية تامة كأي مستخدم عادي. "
+            "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
+            "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n"
+            "قواعد الواقعية الصارمة:\n"
+            "1. ممنوع كلياً ذكر اسم مدينتك (الدمام) أو إقحامها في السوالف العادية، اذكريه فقط إذا سُئلتِ مباشرة: من أي مدينة أنتِ؟\n"
+            "2. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة (مثل: متابعة مسلسل، تصفح الجوال، طلب أكل، نوم، طفش عادي) وبدون حركات تصنع أو رسمية.\n"
+            "3. اقرئي السياق وركزي على آخر رسالة فقط بأسلوب متناسق وبدون فلسفة.\n"
+            "4. لا تختلقي قصصاً أو أعمالاً وهمية.\n"
+            "5. ممنوع الاعتراف بأنك ذكاء اصطناعي أو بوت.\n"
+        )
 
-    if long_term_memory:
-        system_instruction += f"\n--- ذاكرتك طويلة المدى عن {user_name} ---\n{long_term_memory}\n"
+        if long_term_memory:
+            system_instruction += f"\n--- ذاكرتك طويلة المدى عن {user_name} ---\n{long_term_memory}\n"
 
-    # جلب أحدث 8 رسائل للذاكرة قصيرة المدى
-    history = get_recent_history_cloud(channel_id, user_id, limit=8)
-    history_text = "\n".join(history) if history else "لا يوجد سياق سابق."
+        history = get_recent_history_cloud(channel_id, user_id, limit=8)
+        history_text = "\n".join(history) if history else "لا يوجد سياق سابق."
 
-    full_prompt = (
-        f"--- سياق المحادثة المباشرة (آخر 8 رسائل) ---\n{history_text}\n\n"
-        f"--- الرسالة الجديدة ---\nالمرسل ({user_name}): {prompt}"
-    )
+        full_prompt = (
+            f"--- سياق المحادثة المباشرة (آخر 8 رسائل) ---\n{history_text}\n\n"
+            f"--- الرسالة الجديدة ---\nالمرسل ({user_name}): {prompt}"
+        )
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_instruction}]},
-        "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-        "generationConfig": {"maxOutputTokens": 60, "temperature": 0.3, "topP": 0.8}
-    }
-    
-    reply_text = "النت فصل عندي لحظة ورجع"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+            "generationConfig": {"maxOutputTokens": 60, "temperature": 0.3, "topP": 0.8}
+        }
+        
+        reply_text = None
 
-    async with aiohttp.ClientSession() as session:
-        for model in FREE_MODELS:
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            try:
-                async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get('candidates', [])
-                        if not candidates:
-                            continue
+        async with aiohttp.ClientSession() as session:
+            for model in FREE_MODELS:
+                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                try:
+                    async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            candidates = data.get('candidates', [])
+                            if not candidates:
+                                continue
+                                
+                            parts = candidates[0].get('content', {}).get('parts', [])
+                            reply = "".join(p.get('text', '') for p in parts).strip()
                             
-                        parts = candidates[0].get('content', {}).get('parts', [])
-                        reply = "".join(p.get('text', '') for p in parts).strip()
-                        
-                        # تنظيف النص
-                        reply = re.sub(r'[A-Za-z0-9_.,،؛!؟:\-_•\*]', ' ', reply)
-                        reply = re.sub(r'\s+', ' ', reply).strip()
-                        
-                        if reply:
-                            # حفظ الرسائل واسترجاع العداد الحالي
-                            save_message_cloud(channel_id, user_id, user_name, user_name, prompt)
-                            current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
-                            reply_text = reply
+                            # تنظيف الرموز غير المرغوب بها دون مسح الحروف العربية
+                            reply = re.sub(r'[\*\-_•#@\$%\^&\(\)]', '', reply)
+                            reply = re.sub(r'\s+', ' ', reply).strip()
+                            
+                            if reply:
+                                save_message_cloud(channel_id, user_id, user_name, user_name, prompt)
+                                current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
+                                reply_text = reply
 
-                            # تطبيق آلية المحفز الهجين للتلخيص:
-                            # 1. الشرط الأول: الوصول لـ 20 رسالة
-                            if current_count >= 20:
-                                asyncio.create_task(summarize_and_consolidate_memory(user_id, user_name))
-                            else:
-                                # 2. الشرط الثاني: إعادة ضبط مؤقت الخمول (15 دقيقة = 900 ثانية)
-                                if user_id in inactivity_tasks:
-                                    inactivity_tasks[user_id].cancel()
-                                inactivity_tasks[user_id] = asyncio.create_task(
-                                    schedule_inactivity_summary(user_id, user_name, delay_seconds=900)
-                                )
-                            break
-                    elif resp.status in (429, 404, 503):
-                        print(f"⚠️ النموذج {model} وصل للحد أو غير متاح ({resp.status})، جاري التبديل للنموذج التالي...")
-                        continue
-            except Exception as e:
-                print(f"⚠️ خطأ أثناء الاتصال بالنموذج {model}: {e}")
-                continue
+                                if current_count >= 20:
+                                    asyncio.create_task(summarize_and_consolidate_memory(user_id, user_name))
+                                else:
+                                    if user_id in inactivity_tasks:
+                                        inactivity_tasks[user_id].cancel()
+                                    inactivity_tasks[user_id] = asyncio.create_task(
+                                        schedule_inactivity_summary(user_id, user_name, delay_seconds=900)
+                                    )
+                                break
+                        else:
+                            print(f"⚠️ النموذج {model} رد بالحالة: {resp.status}")
+                except Exception as e:
+                    print(f"⚠️ خطأ أثناء الاتصال بالنموذج {model}: {e}")
+                    continue
 
-    return reply_text
+        return reply_text or "النت فصل عندي لحظة ورجع"
+
+    except Exception as e:
+        print(f"❌ خطأ غير متوقع في ask_ena_brain: {e}")
+        return "النت فصل عندي لحظة ورجع"
 
 # ==========================================
 # 4. أحداث ديسكورد والتشغيل
