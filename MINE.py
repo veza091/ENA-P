@@ -19,14 +19,12 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_K
     print("❌ خطأ: لم يتم العثور على كافة المتغيرات المطلوبة في .env!")
     sys.exit(1)
 
-# الاتصال بقاعدة بيانات Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# نماذج قوقل المستقرة لضمان سرعة الاستجابة
 FREE_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
@@ -38,7 +36,6 @@ FREE_MODELS = [
 inactivity_tasks = {}
 
 def clean_text(text):
-    """تنظيف النصوص من الرموز والتكرار لتظهر الردود كبشر"""
     if not text:
         return ""
     text = re.sub(r'<@!?\d+>', '', text)
@@ -60,8 +57,7 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
         u_id = str(user_id)
         u_name = str(user_name)
         
-        # 1. إدخال الرسالة في جدول المحادثات
-        res_conv = supabase.table('conversations').insert({
+        supabase.table('conversations').insert({
             'channel_id': c_id,
             'user_id': u_id,
             'user_name': u_name,
@@ -69,7 +65,6 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
             'content': clean_content
         }).execute()
         
-        # 2. تحديث الملف الشخصي وعدد الرسائل
         profile = supabase.table('user_profiles').select('msg_count').eq('user_id', u_id).execute()
         if profile.data:
             current_count = profile.data[0]['msg_count'] + 1
@@ -95,7 +90,6 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
         return 0
 
 def get_recent_history_structured(channel_id, user_id, limit=8):
-    """جلب المحادثات المهيكلة بأسلوب الأدوار الصحيح (user/model)"""
     try:
         u_id = str(user_id)
         query = supabase.table('conversations').select('role, content').eq('user_id', u_id)
@@ -199,7 +193,7 @@ async def start_web_server():
     print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
 
 # ==========================================
-# 3. الاتصال بـ Gemini API مع جلب الذاكرة
+# 3. الاتصال بـ Gemini API
 # ==========================================
 async def ask_ena_brain(channel_id, user_id, prompt, user_name):
     try:
@@ -207,9 +201,7 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         if not clean_prompt:
             clean_prompt = "هلا"
 
-        # حفظ رسالة المستخدم أولاً في قاعدة البيانات
         save_message_cloud(channel_id, user_id, user_name, user_name, clean_prompt)
-
         long_term_memory, _ = get_user_profile_cloud(user_id)
 
         system_instruction = (
@@ -226,7 +218,6 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         if long_term_memory:
             system_instruction += f"\nملاحظات تفهمينها عن الطرف الآخر ({user_name}):\n{long_term_memory}"
 
-        # جلب المحادثات السابقة لإرسالها ضمن السياق
         contents = get_recent_history_structured(channel_id, user_id, limit=6)
         
         payload = {
@@ -257,7 +248,6 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                             reply = clean_text(reply)
                             
                             if reply:
-                                # حفظ رد البوت في قاعدة البيانات
                                 current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
                                 reply_text = reply
 
@@ -283,7 +273,7 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         return "هلا"
 
 # ==========================================
-# 4. أحداث ديسكورد والتشغيل
+# 4. أحداث ديسكورد
 # ==========================================
 @client.event
 async def on_ready():
