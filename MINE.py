@@ -25,6 +25,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# أسماء نماذج Gemini الرسمية المعتمدة
 FREE_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
@@ -90,6 +91,7 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
         return 0
 
 def get_recent_history_structured(channel_id, user_id, limit=8):
+    """جلب المحادثات مع معالجة وتناوب الأدوار لمنع خطأ 400 من Gemini"""
     try:
         u_id = str(user_id)
         query = supabase.table('conversations').select('role, content').eq('user_id', u_id)
@@ -100,14 +102,27 @@ def get_recent_history_structured(channel_id, user_id, limit=8):
         res = query.order('id', desc=True).limit(limit).execute()
         
         rows = res.data or []
-        contents = []
+        raw_contents = []
         for row in reversed(rows):
             role_type = "model" if row['role'] == "إينا" else "user"
-            contents.append({
+            raw_contents.append({
                 "role": role_type,
                 "parts": [{"text": row['content']}]
             })
-        return contents
+            
+        # دمج الرسائل المتتالية ذات نفس الدور وضمان البدء بـ user
+        cleaned_contents = []
+        for item in raw_contents:
+            if not cleaned_contents:
+                if item['role'] == 'user':
+                    cleaned_contents.append(item)
+            else:
+                if cleaned_contents[-1]['role'] == item['role']:
+                    cleaned_contents[-1]['parts'][0]['text'] += f"\n{item['parts'][0]['text']}"
+                else:
+                    cleaned_contents.append(item)
+                    
+        return cleaned_contents
     except Exception as e:
         print(f"❌ [Supabase Error] فشل جلب الذاكرة: {e}")
         return []
@@ -201,6 +216,7 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         if not clean_prompt:
             clean_prompt = "هلا"
 
+        # حفظ الرسالة الحالية
         save_message_cloud(channel_id, user_id, user_name, user_name, clean_prompt)
         long_term_memory, _ = get_user_profile_cloud(user_id)
 
@@ -218,8 +234,13 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         if long_term_memory:
             system_instruction += f"\nملاحظات تفهمينها عن الطرف الآخر ({user_name}):\n{long_term_memory}"
 
+        # جلب المحادثات السابقة المنظمة
         contents = get_recent_history_structured(channel_id, user_id, limit=6)
         
+        # التأكد من عدم إرسال مصفوفة فارغة لـ Gemini
+        if not contents:
+            contents = [{"role": "user", "parts": [{"text": clean_prompt}]}]
+
         payload = {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "contents": contents,
@@ -261,7 +282,8 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                                     )
                                 break
                         else:
-                            print(f"⚠️ النموذج {model} رد بالحالة: {resp.status}")
+                            err_body = await resp.text()
+                            print(f"⚠️ النموذج {model} رد بالحالة {resp.status}: {err_body}")
                 except Exception as e:
                     print(f"⚠️ خطأ أثناء الاتصال بالنموذج {model}: {e}")
                     continue
