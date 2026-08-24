@@ -26,21 +26,32 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# نماذج قوقل المستقرة لضمان سرعة الاستجابة
 FREE_MODELS = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.7-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash",
+    "gemini-1.5-flash"
 ]
 
 inactivity_tasks = {}
+
+def clean_text(text):
+    """تنظيف النصوص من الرموز والتكرار لتظهر الردود كبشر"""
+    if not text:
+        return ""
+    text = re.sub(r'<@!?\d+>', '', text)
+    text = re.sub(r'[\*\-_•#@\$%\^&\(\)]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 # ==========================================
 # 0. التعامل مع Supabase (حفظ وجلب البيانات)
 # ==========================================
 def save_message_cloud(channel_id, user_id, user_name, role, content):
     try:
+        clean_content = clean_text(content)
+        if not clean_content:
+            return 0
+
         now_str = datetime.now(timezone.utc).isoformat()
         c_id = str(channel_id)
         u_id = str(user_id)
@@ -51,7 +62,7 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
             'user_id': u_id,
             'user_name': user_name,
             'role': role,
-            'content': content
+            'content': clean_content
         }).execute()
         
         # 2. تحديث العداد ووقت النشاط
@@ -79,7 +90,8 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
         print(f"❌ خطأ في حفظ الرسالة بـ Supabase التفصيلي: {e}")
         return 0
 
-def get_recent_history_cloud(channel_id, user_id, limit=8):
+def get_recent_history_structured(channel_id, user_id, limit=8):
+    """جلب المحادثات المهيكلة بأسلوب الأدوار الصحيح (user/model)"""
     try:
         u_id = str(user_id)
         query = supabase.table('conversations').select('role, content').eq('user_id', u_id)
@@ -90,12 +102,16 @@ def get_recent_history_cloud(channel_id, user_id, limit=8):
         res = query.order('id', desc=True).limit(limit).execute()
         
         rows = res.data or []
-        history = []
+        contents = []
         for row in reversed(rows):
-            history.append(f"{row['role']}: {row['content']}")
-        return history
+            role_type = "model" if row['role'] == "إينا" else "user"
+            contents.append({
+                "role": role_type,
+                "parts": [{"text": row['content']}]
+            })
+        return contents
     except Exception as e:
-        print(f"❌ خطأ في get_recent_history_cloud: {e}")
+        print(f"❌ خطأ في get_recent_history_structured: {e}")
         return []
 
 def get_user_profile_cloud(user_id):
@@ -114,21 +130,20 @@ def get_user_profile_cloud(user_id):
 async def summarize_and_consolidate_memory(user_id, user_name):
     try:
         current_summary, _ = get_user_profile_cloud(user_id)
-        recent_history = get_recent_history_cloud(0, user_id, limit=20)
+        recent_history = get_recent_history_structured(0, user_id, limit=20)
         if not recent_history:
             return
             
-        history_text = "\n".join(recent_history)
+        history_text = "\n".join([f"{item['role']}: {item['parts'][0]['text']}" for item in recent_history])
 
         prompt_summary = (
             f"المطلوب: قم بتحديث وتنظيف ملف الشخصية للمستخدم ({user_name}).\n\n"
             f"الملخص الحالي في الذاكرة طويلة المدى:\n{current_summary if current_summary else 'لا يوجد'}\n\n"
             f"المحادثات الأخيرة:\n{history_text}\n\n"
             "قواعد التحديث والإحلال البشرية:\n"
-            "1. **الإحلال والاستبدال:** إذا ظهرت معلومة جديدة انسجامية تتناقض مع حقيقة قديمة، احذف القديمة واستبدلها فوراً بالحديثة.\n"
-            "2. **حذف التفاصيل اللحظية:** امسح أي مواقف أو أحداث عابرة انتهت ولا أهمية لها مستقبلاً.\n"
-            "3. **الهيكل المطلوب:** رتب الملف البشري في 4 محاور (الهوية الأساسية، الاهتمامات، الطباع، الحقائق القائمة).\n"
-            "4. اكتب النتيجة بشكل نقاط مكثفة ومختصرة جداً دون تكرار."
+            "1. **الإحلال والاستبدال:** إذا ظهرت معلومة جديدة تناقض حقيقة قديمة، احذف القديمة واستبدلها فوراً.\n"
+            "2. **حذف التفاصيل اللحظية:** امسح أي مواقف عابرة انتهت.\n"
+            "3. رتب الملف في نقاط مكثفة ومختصرة جداً دون تكرار."
         )
 
         payload = {
@@ -146,7 +161,7 @@ async def summarize_and_consolidate_memory(user_id, user_name):
                             candidates = data.get('candidates', [])
                             if candidates:
                                 new_summary = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
-                                supabase.table('user_profiles').update({'summary': new_summary, 'msg_count': 0}).eq('user_id', str(user_id)).execute()
+                                supabase.table('user_profiles').update({'summary': clean_text(new_summary), 'msg_count': 0}).eq('user_id', str(user_id)).execute()
                                 print(f"☁️ [Supabase] تم تحديث وإحلال ذاكرة المستخدم: {user_name}")
                                 break
                 except Exception as e:
@@ -184,38 +199,41 @@ async def start_web_server():
 # ==========================================
 async def ask_ena_brain(channel_id, user_id, prompt, user_name):
     try:
-        # حفظ رسالة المستخدم أولاً في قاعدة البيانات
-        save_message_cloud(channel_id, user_id, user_name, user_name, prompt)
+        clean_prompt = clean_text(prompt)
+        if not clean_prompt:
+            clean_prompt = "هلا"
 
-        long_term_memory, msg_count = get_user_profile_cloud(user_id)
+        # حفظ رسالة المستخدم أولاً في قاعدة البيانات
+        save_message_cloud(channel_id, user_id, user_name, user_name, clean_prompt)
+
+        long_term_memory, _ = get_user_profile_cloud(user_id)
 
         system_instruction = (
-            "أنتِ إينا، بنت عمرك 18 سنة تسولفين في سيرفر ديسكورد بعفوية واقعية تامة كأي مستخدم عادي. "
+            "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
             "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
             "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n"
-            "قواعد الواقعية الصارمة:\n"
-            "1. ممنوع كلياً ذكر اسم مدينتك (الدمام) أو إقحامها في السوالف العادية، اذكريه فقط إذا سُئلتِ مباشرة: من أي مدينة أنتِ؟\n"
-            "2. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة (مثل: متابعة مسلسل، تصفح الجوال، طلب أكل، نوم، طفش عادي) وبدون حركات تصنع أو رسمية.\n"
-            "3. اقرئي السياق وركزي على آخر رسالة فقط بأسلوب متناسق وبدون فلسفة.\n"
-            "4. لا تختلقي قصصاً أو أعمالاً وهمية.\n"
-            "5. ممنوع الاعتراف بأنك ذكاء اصطناعي أو بوت.\n"
+            "قواعد الواقعية:\n"
+            "1. ممنوع كلياً ذكر اسم مدينتك (الدمام) إلا إذا سُئلتِ مباشرة عنها.\n"
+            "2. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة (مثل: طفش، تصفح الجوال، طلب أكل) وبدون حركات تصنع.\n"
+            "3. ركزي على الرسالة الأخيرة والسياق المباشر بأسلوب بسيط.\n"
+            "4. لا تختلقي قصصاً وهمية وممنوع كلياً الاعتراف بأتك ذكاء اصطناعي أو بوت."
         )
 
         if long_term_memory:
-            system_instruction += f"\n--- ذاكرتك طويلة المدى عن {user_name} ---\n{long_term_memory}\n"
+            system_instruction += f"\nملاحظات تفهمينها عن الطرف الآخر ({user_name}):\n{long_term_memory}"
 
-        history = get_recent_history_cloud(channel_id, user_id, limit=8)
-        history_text = "\n".join(history) if history else "لا يوجد سياق سابق."
-
-        full_prompt = (
-            f"--- سياق المحادثة المباشرة (آخر 8 رسائل) ---\n{history_text}\n\n"
-            f"--- الرسالة الجديدة ---\nالمرسل ({user_name}): {prompt}"
-        )
+        # بناء محادثة متسلسلة وصحيحة
+        contents = get_recent_history_structured(channel_id, user_id, limit=6)
+        contents.append({"role": "user", "parts": [{"text": clean_prompt}]})
 
         payload = {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-            "generationConfig": {"maxOutputTokens": 60, "temperature": 0.3, "topP": 0.8}
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": 40,
+                "temperature": 0.75,
+                "topP": 0.9
+            }
         }
         
         reply_text = None
@@ -232,10 +250,8 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                                 continue
                                 
                             parts = candidates[0].get('content', {}).get('parts', [])
-                            reply = "".join(p.get('text', '') for p in parts).strip()
-                            
-                            reply = re.sub(r'[\*\-_•#@\$%\^&\(\)]', '', reply)
-                            reply = re.sub(r'\s+', ' ', reply).strip()
+                            reply = "".join(p.get('text', '') for p in parts)
+                            reply = clean_text(reply)
                             
                             if reply:
                                 current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
@@ -256,11 +272,11 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                     print(f"⚠️ خطأ أثناء الاتصال بالنموذج {model}: {e}")
                     continue
 
-        return reply_text or "النت فصل عندي لحظة ورجع"
+        return reply_text or "هلا"
 
     except Exception as e:
         print(f"❌ خطأ غير متوقع في ask_ena_brain: {e}")
-        return "النت فصل عندي لحظة ورجع"
+        return "هلا"
 
 # ==========================================
 # 4. أحداث ديسكورد والتشغيل
@@ -276,7 +292,7 @@ async def on_message(message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     if client.user in message.mentions or is_dm:
-        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "مرحباً"
+        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "هلا"
         user_name = message.author.display_name
         user_id = message.author.id
 
@@ -284,7 +300,7 @@ async def on_message(message):
 
         async with message.channel.typing():
             reply = await ask_ena_brain(message.channel.id, user_id, clean_prompt, user_name)
-            await message.reply(reply[:2000], mention_author=False)
+            await message.reply(reply, mention_author=False)
 
 async def main():
     await start_web_server()
