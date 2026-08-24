@@ -47,7 +47,7 @@ def clean_text(text):
     return text.strip()
 
 # ==========================================
-# 0. التعامل مع Supabase (حفظ وجلب البيانات)
+# 0. التعامل مع Supabase (مُصحح ومُؤمن)
 # ==========================================
 def save_message_cloud(channel_id, user_id, user_name, role, content):
     try:
@@ -58,39 +58,40 @@ def save_message_cloud(channel_id, user_id, user_name, role, content):
         now_str = datetime.now(timezone.utc).isoformat()
         c_id = str(channel_id)
         u_id = str(user_id)
+        u_name = str(user_name)
         
         # 1. إدخال الرسالة في جدول المحادثات
-        supabase.table('conversations').insert({
+        res_conv = supabase.table('conversations').insert({
             'channel_id': c_id,
             'user_id': u_id,
-            'user_name': user_name,
-            'role': role,
+            'user_name': u_name,
+            'role': str(role),
             'content': clean_content
         }).execute()
         
-        # 2. تحديث العداد ووقت النشاط
+        # 2. تحديث الملف الشخصي وعدد الرسائل
         profile = supabase.table('user_profiles').select('msg_count').eq('user_id', u_id).execute()
         if profile.data:
             current_count = profile.data[0]['msg_count'] + 1
             supabase.table('user_profiles').update({
                 'msg_count': current_count,
-                'user_name': user_name,
+                'user_name': u_name,
                 'last_active': now_str
             }).eq('user_id', u_id).execute()
         else:
             current_count = 1
             supabase.table('user_profiles').insert({
                 'user_id': u_id,
-                'user_name': user_name,
+                'user_name': u_name,
                 'summary': '',
                 'msg_count': 1,
                 'last_active': now_str
             }).execute()
             
-        print(f"💾 [Supabase] تم حفظ رسالة ({role}) للمستخدم {user_name}")
+        print(f"💾 [Supabase Success] تم حفظ رسالة ({role}) للمستخدم {u_name}")
         return current_count
     except Exception as e:
-        print(f"❌ خطأ في حفظ الرسالة بـ Supabase التفصيلي: {e}")
+        print(f"❌ [Supabase Error] فشل الحفظ في القاعدة: {e}")
         return 0
 
 def get_recent_history_structured(channel_id, user_id, limit=8):
@@ -114,7 +115,7 @@ def get_recent_history_structured(channel_id, user_id, limit=8):
             })
         return contents
     except Exception as e:
-        print(f"❌ خطأ في get_recent_history_structured: {e}")
+        print(f"❌ [Supabase Error] فشل جلب الذاكرة: {e}")
         return []
 
 def get_user_profile_cloud(user_id):
@@ -124,7 +125,7 @@ def get_user_profile_cloud(user_id):
             return res.data[0]['summary'], res.data[0]['msg_count']
         return "", 0
     except Exception as e:
-        print(f"❌ خطأ في get_user_profile_cloud: {e}")
+        print(f"❌ [Supabase Error] فشل جلب البروفايل: {e}")
         return "", 0
 
 # ==========================================
@@ -225,10 +226,9 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
         if long_term_memory:
             system_instruction += f"\nملاحظات تفهمينها عن الطرف الآخر ({user_name}):\n{long_term_memory}"
 
-        # بناء محادثة متسلسلة وصحيحة
+        # جلب المحادثات السابقة لإرسالها ضمن السياق
         contents = get_recent_history_structured(channel_id, user_id, limit=6)
-        contents.append({"role": "user", "parts": [{"text": clean_prompt}]})
-
+        
         payload = {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "contents": contents,
@@ -257,6 +257,7 @@ async def ask_ena_brain(channel_id, user_id, prompt, user_name):
                             reply = clean_text(reply)
                             
                             if reply:
+                                # حفظ رد البوت في قاعدة البيانات
                                 current_count = save_message_cloud(channel_id, user_id, user_name, "إينا", reply)
                                 reply_text = reply
 
