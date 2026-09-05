@@ -6,7 +6,7 @@ import discord
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from motor.motor_asyncio import AsyncIOMotorClient
 
 # تحميل متغيرات البيئة
 load_dotenv()
@@ -14,23 +14,23 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 MAIN_GEMINI_API_KEY = (os.getenv('MAIN_GEMINI_API_KEY') or os.getenv('GEMINI_API_KEY') or "").strip()
 MEMORY_GEMINI_API_KEY = (os.getenv('MEMORY_GEMINI_API_KEY') or MAIN_GEMINI_API_KEY).strip()
 
-SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip()
-SUPABASE_KEY = os.getenv('SUPABASE_KEY', '').strip()
+MONGODB_URI = os.getenv('MONGODB_URI', '').strip()
 
 if not DISCORD_TOKEN or not MAIN_GEMINI_API_KEY:
     print("❌ خطأ: لم يتم العثور على المتغيرات الأساسية (DISCORD_TOKEN أو MAIN_GEMINI_API_KEY) في البيئة!")
     sys.exit(1)
 
-# إعداد عميل Supabase
-supabase: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
+# إعداد عميل MongoDB (NoSQL)
+db = None
+if MONGODB_URI:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("⚡ [Supabase] تم الاتصال بقاعدة البيانات بنجاح.")
+        mongo_client = AsyncIOMotorClient(MONGODB_URI)
+        db = mongo_client["ena_bot_db"]
+        print("⚡ [MongoDB] تم الاتصال بقاعدة البيانات بنجاح.")
     except Exception as e:
-        print(f"⚠️ [Supabase Warning] فشل الاتصال بقاعدة البيانات: {e}")
+        print(f"⚠️ [MongoDB Warning] فشل الاتصال بقاعدة البيانات: {e}")
 else:
-    print("⚠️ [Supabase Warning] لم يتم توفير بيانات الاتصال بـ Supabase. ستعمل الذاكرة مؤقتاً بدون حفظ دائم.")
+    print("⚠️ [MongoDB Warning] لم يتم توفير رابط الاتصال بـ MongoDB. ستعمل الذاكرة مؤقتاً بدون حفظ دائم.")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -80,61 +80,65 @@ async def start_web_server():
     print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
 
 # ==========================================
-# 2. دوال التعامل مع قاعدة البيانات (Supabase)
+# 2. دوال التعامل مع قاعدة البيانات (MongoDB - NoSQL)
 # ==========================================
 async def get_user_profile_db(user_id, user_name):
-    if not supabase:
+    if db is None:
         return {"core_facts": "", "msg_count": 0}
     try:
-        res = supabase.table("user_profiles").select("*").eq("user_id", str(user_id)).execute()
-        if res.data:
-            return res.data[0]
+        profile = await db.user_profiles.find_one({"user_id": str(user_id)})
+        if profile:
+            return profile
         else:
             new_profile = {"user_id": str(user_id), "user_name": user_name, "core_facts": "", "msg_count": 0}
-            supabase.table("user_profiles").insert(new_profile).execute()
+            await db.user_profiles.insert_one(new_profile)
             return new_profile
     except Exception as e:
         print(f"⚠️ [DB Error - get_user_profile]: {e}")
         return {"core_facts": "", "msg_count": 0}
 
 async def save_message_db(channel_id, user_id, user_name, role, content):
-    if not supabase:
+    if db is None:
         return
     try:
-        supabase.table("conversations").insert({
+        await db.conversations.insert_one({
             "channel_id": str(channel_id),
             "user_id": str(user_id),
             "user_name": user_name,
             "role": role,
-            "content": content
-        }).execute()
+            "content": content,
+            "created_at": asyncio.get_event_loop().time()
+        })
     except Exception as e:
         print(f"⚠️ [DB Error - save_message]: {e}")
 
 async def get_recent_history_db(channel_id, limit=8):
-    if not supabase:
+    if db is None:
         return []
     try:
-        res = supabase.table("conversations").select("*").eq("channel_id", str(channel_id)).order("created_at", desc=True).limit(limit).execute()
-        messages = res.data[::-1] if res.data else []
-        return messages
+        cursor = db.conversations.find({"channel_id": str(channel_id)}).sort("_id", -1).limit(limit)
+        messages = await cursor.to_list(length=limit)
+        return messages[::-1]
     except Exception as e:
         print(f"⚠️ [DB Error - get_recent_history]: {e}")
         return []
 
-def update_user_memory_db(user_id, user_name, new_facts, new_count=None):
-    if not supabase:
+async def update_user_memory_db(user_id, user_name, new_facts, new_count=None):
+    if db is None:
         return
     try:
         payload = {
-            "user_id": str(user_id),
             "user_name": user_name,
             "core_facts": new_facts,
-            "last_active": "now()"
+            "last_active": asyncio.get_event_loop().time()
         }
         if new_count is not None:
             payload["msg_count"] = new_count
-        supabase.table("user_profiles").upsert(payload).execute()
+        await db.user_profiles.update_one(
+            {"user_id": str(user_id)},
+            {"$set": payload},
+            upsert=True
+        )
     except Exception as e:
         print(f"⚠️ [DB Error - update_user_memory]: {e}")
 
@@ -181,7 +185,7 @@ async def run_memory_filter_background(user_id, user_name, recent_chat_text, cur
                         if candidates:
                             extracted_text = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
                             if extracted_text:
-                                update_user_memory_db(user_id, user_name, extracted_text)
+                                await update_user_memory_db(user_id, user_name, extracted_text)
                                 print(f"🧠 [Memory Success] تم تحديث ذاكرة {user_name} بواسطة النموذج: {model}")
                                 break
                     else:
@@ -320,7 +324,7 @@ async def on_message(message):
             )
 
         # تحديث العداد في DB
-        update_user_memory_db(user_id, user_name, core_facts, new_count=msg_count)
+        await update_user_memory_db(user_id, user_name, core_facts, new_count=msg_count)
 
 async def main():
     await start_web_server()
