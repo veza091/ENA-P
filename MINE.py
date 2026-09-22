@@ -2,8 +2,15 @@ import asyncio
 import json
 import os
 import re
+import ssl
 import sys
 from collections import defaultdict
+
+# إجبار بايثون على إفراغ السجلات لحظياً على Render دون انتظار (Unbuffered output)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 import aiohttp
 import asyncpg
@@ -25,13 +32,14 @@ MEMORY_GEMINI_API_KEY = (
     os.getenv("MEMORY_GEMINI_API_KEY") or MAIN_GEMINI_API_KEY
 ).strip()
 
-# رابط PostgreSQL من Supabase أو Render. لا يوضع في GitHub.
+# رابط PostgreSQL من Supabase Session Pooler (port 5432)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-# فعّله عند استخدام Supabase أو أي رابط Postgres خارجي يتطلب TLS.
-DATABASE_SSL = os.getenv("DATABASE_SSL", "false").strip().lower() in {"1", "true", "yes"}
+# تفعيل SSL (افتراضياً مفعل إذا كان الرابط Supabase)
+DATABASE_SSL_ENV = os.getenv("DATABASE_SSL", "").strip().lower()
+DATABASE_SSL = DATABASE_SSL_ENV in {"1", "true", "yes"} or "supabase" in DATABASE_URL
 
 if not DISCORD_TOKEN or not MAIN_GEMINI_API_KEY:
-    print("❌ يلزم ضبط DISCORD_TOKEN و MAIN_GEMINI_API_KEY في متغيرات البيئة.")
+    print("❌ يلزم ضبط DISCORD_TOKEN و MAIN_GEMINI_API_KEY في متغيرات البيئة.", flush=True)
     sys.exit(1)
 
 
@@ -88,11 +96,15 @@ def memories_to_prompt(memories):
 
 
 # =========================================================
-# خادم الويب
+# خادم الويب (Render Port Binding & Health Check)
 # =========================================================
 async def handle_ping(request):
     database_state = "ready" if db_pool is not None else "unavailable"
-    return web.json_response({"status": "ok", "database": database_state})
+    return web.json_response({
+        "status": "ok" if db_pool is not None else "degraded",
+        "database": database_state,
+        "service": "ENA Discord Bot"
+    })
 
 
 async def start_web_server():
@@ -101,75 +113,128 @@ async def start_web_server():
     app.router.add_get("/health", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "10000"))
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
+    print(f"🌐 [Web Server] يعمل على المنفذ: {port}", flush=True)
 
 
 # =========================================================
-# PostgreSQL: رسائل + ذاكرة منظمة
+# PostgreSQL: رسائل + ذاكرة منظمة مع Supabase
 # =========================================================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    discord_user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'model')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS messages_user_channel_created_idx
+    ON messages (discord_user_id, channel_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id BIGSERIAL PRIMARY KEY,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    memory_key TEXT NOT NULL,
+    memory_value TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'profile',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7
+        CHECK (confidence >= 0 AND confidence <= 1),
+    source_message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (discord_user_id, memory_key)
+);
+CREATE INDEX IF NOT EXISTS memories_user_updated_idx
+    ON memories (discord_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS memories_user_conf_idx
+    ON memories (discord_user_id, confidence DESC, updated_at DESC);
+
+-- تفعيل حماية RLS لمنع وصول واجهات Supabase العامة (REST API) لذاكرة المستخدمين
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+
+-- حظر الوصول لأدوار anon و authenticated في Supabase إذا كانت موجودة
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON TABLE users, messages, memories FROM anon;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON TABLE users, messages, memories FROM authenticated;
+    END IF;
+END $$;
+"""
+
+
 async def initialize_database():
-    """يفتح اتصالاً حقيقياً وينشئ الجداول والفهارس عند أول تشغيل."""
+    """يفتح اتصالاً بـ Supabase Postgres وينشئ الجداول والفهارس عند الإقلاع."""
     global db_pool
+
     if not DATABASE_URL:
-        print("⚠️ لم يتم ضبط DATABASE_URL؛ البوت سيعمل، لكن لن يحتفظ بذاكرة دائمة.")
+        print("❌ [Postgres] لم يتم العثور على DATABASE_URL في متغيرات البيئة! الذاكرة الدائمة لن تعمل.", flush=True)
         return
 
-    try:
-        pool_options = {
-            "min_size": 1,
-            "max_size": 5,
-            "command_timeout": 10,
-        }
-        if DATABASE_SSL:
-            pool_options["ssl"] = True
-        db_pool = await asyncpg.create_pool(DATABASE_URL, **pool_options)
-        async with db_pool.acquire() as connection:
-            await connection.execute("SELECT 1")
-            await connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    discord_user_id TEXT PRIMARY KEY,
-                    display_name TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
+    # فحص نوع الرابط للتنبيه
+    if "pooler.supabase.com" not in DATABASE_URL and "supabase" in DATABASE_URL:
+        print(
+            "⚠️ [Postgres تحذير] الرابط المستخدم يبدو أنه Direct connection وليس Session Pooler!\n"
+            "   خدمة Render تدعم IPv4 فقط وقد يفشل الاتصال. يرجى استخدام رابط Session Pooler على المنفذ 5432.",
+            flush=True,
+        )
 
-                CREATE TABLE IF NOT EXISTS messages (
-                    id BIGSERIAL PRIMARY KEY,
-                    channel_id TEXT NOT NULL,
-                    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
-                        ON DELETE CASCADE,
-                    role TEXT NOT NULL CHECK (role IN ('user', 'model')),
-                    content TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                CREATE INDEX IF NOT EXISTS messages_user_channel_created_idx
-                    ON messages (discord_user_id, channel_id, created_at DESC);
+    # ضبط إعدادات الاتصال
+    # مهم: statement_cache_size=0 ضروري عند التعامل مع PgBouncer / Supabase Pooler
+    pool_options = {
+        "min_size": 1,
+        "max_size": 5,
+        "command_timeout": 15,
+        "statement_cache_size": 0,
+    }
 
-                CREATE TABLE IF NOT EXISTS memories (
-                    id BIGSERIAL PRIMARY KEY,
-                    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
-                        ON DELETE CASCADE,
-                    memory_key TEXT NOT NULL,
-                    memory_value TEXT NOT NULL,
-                    category TEXT NOT NULL DEFAULT 'profile',
-                    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7
-                        CHECK (confidence >= 0 AND confidence <= 1),
-                    source_message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (discord_user_id, memory_key)
-                );
-                CREATE INDEX IF NOT EXISTS memories_user_updated_idx
-                    ON memories (discord_user_id, updated_at DESC);
-                """
-            )
-        print("✅ [Postgres] تم اختبار الاتصال وتجهيز جداول الذاكرة.")
-    except Exception as error:
-        db_pool = None
-        print(f"❌ [Postgres] فشل الاتصال؛ الذاكرة الدائمة متوقفة: {error}")
+    if DATABASE_SSL:
+        pool_options["ssl"] = "require"
+
+    # تصحيح بداية الرابط إذا بدأ بـ postgres://
+    dsn = DATABASE_URL
+    if dsn.startswith("postgres://"):
+        dsn = "postgresql://" + dsn[len("postgres://"):]
+
+    print("🔌 [Postgres] جاري الاتصال بقاعدة البيانات وإنشاء الجداول...", flush=True)
+
+    # محاولة الاتصال مع إعادة المحاولة في حال تأخر الاستجابة
+    for attempt in range(1, 4):
+        try:
+            db_pool = await asyncpg.create_pool(dsn, **pool_options)
+            async with db_pool.acquire() as connection:
+                await connection.execute("SELECT 1")
+                await connection.execute(SCHEMA_SQL)
+            print("✅ [Postgres] تم الاتصال بنجاح وتجهيز جداول (users, messages, memories) وتفعيل حماية RLS.", flush=True)
+            return
+        except Exception as error:
+            print(f"⚠️ [Postgres] المحاولة {attempt}/3 فشلت: {error}", flush=True)
+            if db_pool:
+                await db_pool.close()
+                db_pool = None
+            if attempt < 3:
+                await asyncio.sleep(2)
+            else:
+                print(
+                    "❌ [Postgres] تعذر الاتصال نهائياً بقاعدة البيانات!\n"
+                    "   تأكد من صحة DATABASE_URL (Session Pooler: pooler.supabase.com:5432) وصحة كلمة المرور.",
+                    flush=True,
+                )
 
 
 async def upsert_user(user_id, user_name):
@@ -295,7 +360,7 @@ def valid_memory(memory):
 
 
 # =========================================================
-# Gemini: استخراج ذاكرة منظمة
+# Gemini: الاتصال واستخراج الذاكرة المنظمة
 # =========================================================
 async def request_gemini(models, api_key, payload, label):
     async with aiohttp.ClientSession() as session:
@@ -315,7 +380,8 @@ async def request_gemini(models, api_key, payload, label):
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as response:
                     if response.status != 200:
-                        print(f"⚠️ [{label}] {model}: الحالة {response.status}: {await response.text()}")
+                        err_text = await response.text()
+                        print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
                         continue
                     data = await response.json()
                     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
@@ -323,16 +389,24 @@ async def request_gemini(models, api_key, payload, label):
                     if result:
                         return result
             except Exception as error:
-                print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}")
+                print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
     return None
 
 
 def parse_memory_json(text):
     if not text:
         return []
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    cleaned = text.strip()
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(1)
+    else:
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            cleaned = cleaned[first_brace : last_brace + 1]
     try:
-        payload = json.loads(text)
+        payload = json.loads(cleaned)
     except json.JSONDecodeError:
         return []
     memories = payload.get("memories", []) if isinstance(payload, dict) else []
@@ -340,7 +414,7 @@ def parse_memory_json(text):
 
 
 async def update_memory_in_background(user_id, user_name, recent_history, source_message_id):
-    """مهمة منفصلة ومتسلسلة لكل مستخدم، حتى لا تكتب رسالة قديمة فوق الأحدث."""
+    """مهمة خلفية لاستخراج الحقائق من الحديث وحفظها في Supabase لكل مستخدم."""
     if db_pool is None or not MEMORY_GEMINI_API_KEY:
         return
 
@@ -382,7 +456,7 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
         memories = parse_memory_json(result)
         saved_count = await save_memories(user_id, source_message_id, memories)
         if saved_count:
-            print(f"🧠 [Memory] تم حفظ {saved_count} حقيقة للمستخدم {user_name}.")
+            print(f"🧠 [Memory] تم حفظ {saved_count} حقيقة للمستخدم {user_name}.", flush=True)
 
 
 # =========================================================
@@ -426,7 +500,9 @@ async def ask_ena_brain(clean_prompt, user_name, memories, history_messages):
 # =========================================================
 @client.event
 async def on_ready():
-    print(f"✅ تم الاتصال بنجاح: {client.user}")
+    db_status = "متصلة ✅" if db_pool is not None else "غير متصلة ❌"
+    print(f"✅ تم الاتصال بنجاح بحساب ديسكورد: {client.user}", flush=True)
+    print(f"📊 حالة قاعدة البيانات: {db_status}", flush=True)
 
 
 @client.event
@@ -454,19 +530,25 @@ async def on_message(message):
 
         await save_message(message.channel.id, user_id, "model", reply)
 
-        # تبدأ بعد الرد كي لا تبطئ Discord، وتستخدم قفلاً يمنع سباق التحديثات.
+        # تبدأ في الخلفية بعد الرد لعدم تأخير استجابة ديسكورد
         if user_message_id is not None:
             asyncio.create_task(
                 update_memory_in_background(user_id, user_name, recent_history, user_message_id)
             )
     except Exception as error:
-        print(f"❌ [Message Error] {error}")
+        print(f"❌ [Message Error] {error}", flush=True)
         await message.reply("صار عندي تعليق بسيط، جرب مرة ثانية.", mention_author=False)
 
 
+# =========================================================
+# نقطة الدخول الرئيسية
+# =========================================================
 async def main():
+    # 1. تهيئة قاعدة البيانات أولاً قبل تشغيل ديسكورد
     await initialize_database()
+    # 2. تشغيل خادم الويب للربط مع منفذ Render
     await start_web_server()
+    # 3. تشغيل عميل ديسكورد
     await client.start(DISCORD_TOKEN)
 
 
@@ -474,6 +556,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 تم إيقاف البوت.")
-
+        print("\n🛑 تم إيقاف البوت.", flush=True)
 
