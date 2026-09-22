@@ -1,12 +1,12 @@
 import asyncio
 import json
 import os
+import random
 import re
-import ssl
 import sys
 import urllib.parse
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # إجبار بايثون على إفراغ السجلات لحظياً على Render دون انتظار (Unbuffered output)
 if hasattr(sys.stdout, "reconfigure"):
@@ -122,8 +122,14 @@ MEMORY_MODELS = configured_models(
 
 HISTORY_LIMIT = bounded_setting("HISTORY_LIMIT", 10, 4, 30)
 
+# ردود احتياطية متنوعة إذا رجع النموذج بنتيجة فارغة (بدل تكرار «هلا» في كل مرة)
+FALLBACK_REPLIES = ("هلا", "نعم؟", "ايش صار", "قول")
+
 db_pool = None
+http_session = None
 memory_locks = defaultdict(asyncio.Lock)
+# آخر اسم معروف لكل مستخدم: لا نكتب سطر المستخدمين في القاعدة إلا عند أول ظهور أو تغيّر الاسم
+user_name_cache = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -139,21 +145,49 @@ def clean_text(text):
     return text.strip()
 
 
-# كلمات شائعة للتجاهل عند استخراج الكلمات المفتاحية
-STOP_WORDS = {
+# تطبيع النص العربي: توحيد الحروف المتشابهة وحذف التشكيل والتطويل قبل أي مطابقة
+ARABIC_LETTER_MAP = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ئ": "ي", "ؤ": "و", "ة": "ه",
+})
+ARABIC_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670\u0640]")
+
+# سوابق التعريف والوصل التي تُحذف من بداية الكلمة قبل المقارنة (الأطول أولاً)
+ARTICLE_PREFIXES = ("وال", "فال", "بال", "كال", "لل", "ال")
+
+
+def normalize_arabic(text):
+    """يوحّد أشكال الحروف العربية (أ/إ/آ ← ا، ى ← ي، ة ← ه...) ويحذف التشكيل والتطويل."""
+    if not text:
+        return ""
+    return ARABIC_DIACRITICS_RE.sub("", text.translate(ARABIC_LETTER_MAP))
+
+
+# كلمات شائعة للتجاهل عند استخراج الكلمات المفتاحية (تُطبَّع بنفس قواعد المطابقة أدناه)
+RAW_STOP_WORDS = {
     "انا", "أنا", "هو", "هي", "هم", "نحن", "انت", "أنت", "في", "من", "إلى", "على", "عن", "مع",
     "هذا", "هذه", "تم", "كان", "كنت", "ما", "لا", "لم", "لن", "هل", "وش", "ليه", "كيف", "وين",
     "اللي", "الي", "يلي", "شو", "بدك", "بس", "كل", "يا", "ان", "أن", "إن", "او", "أو", "ثم",
     "بعد", "قبل", "حتى", "إذا", "اذا", "عشان", "عشا", "لأنه", "لانه", "هيك", "كذا", "طيب"
 }
+STOP_WORDS = {normalize_arabic(word) for word in RAW_STOP_WORDS}
 
 
 def extract_keywords(text):
-    """يستخرج الكلمات الدلالية الهامة من الحديث للربط التلقائي بالذاكرة."""
+    """يستخرج الكلمات الدلالية الهامة بعد تطبيعها للربط التلقائي بالذاكرة."""
     if not text:
         return set()
-    words = re.findall(r"[\w\u0600-\u06FF]+", text.lower())
-    return {w for w in words if len(w) > 2 and w not in STOP_WORDS}
+    words = re.findall(r"[\w\u0600-\u06FF]+", normalize_arabic(text.lower()))
+    keywords = set()
+    for word in words:
+        for prefix in ARTICLE_PREFIXES:
+            # لا نحذف السابقة إلا إذا بقي جذع بطول 3 أحرف فأكثر حتى لا نُضيّع كلمات قصيرة
+            if word.startswith(prefix) and len(word) > len(prefix) + 2:
+                word = word[len(prefix):]
+                break
+        if len(word) > 2 and word not in STOP_WORDS:
+            keywords.add(word)
+    return keywords
 
 
 def human_time_ago(occurred_at):
@@ -304,9 +338,9 @@ async def initialize_database():
     if cleaned_dsn != DATABASE_URL:
         print("💡 [Postgres] تم تنظيف رابط DATABASE_URL وإزالة الأقواس المربعة [ ] الزائدة تلقائياً.", flush=True)
 
-    if "[" in DATABASE_URL or "]" in DATABASE_URL:
-        print("⚠️ [Postgres تنبيه] لاحظنا وجود أقواس مربعة '[' أو ']' في DATABASE_URL الأصلي على Render!\n"
-              "   يرجى مسح الأقواس المربعة حول كلمة المرور أو معرّف المشروع في Render Environment.", flush=True)
+    if "[" in cleaned_dsn or "]" in cleaned_dsn:
+        print("⚠️ [Postgres تنبيه] ما زالت هناك أقواس مربعة '[' أو ']' في الرابط حتى بعد التنظيف!\n"
+              "   يرجى مراجعة DATABASE_URL في Render Environment (غالباً حول المضيف أو اسم القاعدة).", flush=True)
 
     pool_options = {
         "min_size": 1,
@@ -434,9 +468,8 @@ async def get_associative_context(user_id, current_prompt):
 
             # معلومات الملف الأساسية تبقى موجودة دائماً
             is_core = cat in {"profile", "identity"} or "name" in key
-            # فحص إذا كانت الذكرى مرتبطة بمواضيع الرسالة الحالية
-            val_words = set(re.findall(r"[\w\u0600-\u06FF]+", val.lower()))
-            matches_topic = bool(prompt_keywords & val_words)
+            # فحص إذا كانت الذكرى مرتبطة بمواضيع الرسالة الحالية (بنفس التطبيع العربي)
+            matches_topic = bool(prompt_keywords & extract_keywords(val))
 
             if is_core or matches_topic or len(selected_memories) < 4:
                 selected_memories.append(dict(row))
@@ -470,7 +503,8 @@ async def get_associative_context(user_id, current_prompt):
 
         selected_episodes = []
         for ep in raw_episodes:
-            ep_topics = set(ep["topics"] or [])
+            # تطبيع مواضيع الموقف عند الاسترجاع أيضاً حتى تطابق الصفوف القديمة المخزنة قبل التطبيع
+            ep_topics = extract_keywords(" ".join(ep["topics"] or []))
             # جلب آخر موقف حدث دائماً (لسياق المرة السابقة) أو المواقف المرتبطة بالسالفة الحالية
             if not selected_episodes or bool(prompt_keywords & ep_topics):
                 selected_episodes.append({
@@ -628,34 +662,42 @@ def valid_memory(memory):
 # =========================================================
 # Gemini: الاتصال واستخراج الذاكرة والمواقف
 # =========================================================
+async def get_http_session():
+    """جلسة aiohttp مشتركة واحدة لإعادة استخدام الاتصالات بدل فتح جلسة جديدة لكل طلب."""
+    global http_session
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession()
+    return http_session
+
+
 async def request_gemini(models, api_key, payload, label):
-    async with aiohttp.ClientSession() as session:
-        for model in models:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent"
-            )
-            try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": api_key,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as response:
-                    if response.status != 200:
-                        err_text = await response.text()
-                        print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
-                        continue
-                    data = await response.json()
-                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    result = "".join(part.get("text", "") for part in parts).strip()
-                    if result:
-                        return result
-            except Exception as error:
-                print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
+    session = await get_http_session()
+    for model in models:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
+                },
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as response:
+                if response.status != 200:
+                    err_text = await response.text()
+                    print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
+                    continue
+                data = await response.json()
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                result = "".join(part.get("text", "") for part in parts).strip()
+                if result:
+                    return result
+        except Exception as error:
+            print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
     return None
 
 
@@ -683,13 +725,14 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
         return
 
     async with memory_locks[str(user_id)]:
-        conversation = "\n".join(
-            f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
-            for message in recent_history
-        )
+        try:
+            conversation = "\n".join(
+                f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
+                for message in recent_history
+            )
 
-        # 1. استخراج حقائق الذاكرة الدائمة
-        fact_prompt = f"""
+            # 1. استخراج حقائق الذاكرة الدائمة
+            fact_prompt = f"""
 أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name}.
 لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
 
@@ -699,28 +742,23 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 المحادثة الأخيرة:
 {conversation}
 """
-        fact_result = await request_gemini(
-            MEMORY_MODELS,
-            MEMORY_GEMINI_API_KEY,
-            {
-                "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 250,
-                    "temperature": 0.1,
-                    "responseMimeType": "application/json",
+            fact_task = request_gemini(
+                MEMORY_MODELS,
+                MEMORY_GEMINI_API_KEY,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 250,
+                        "temperature": 0.1,
+                        "responseMimeType": "application/json",
+                    },
                 },
-            },
-            "Fact-Memory",
-        )
-        fact_data = parse_json_safely(fact_result)
-        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
-        saved_count = await save_memories(user_id, source_message_id, memories)
-        if saved_count:
-            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.", flush=True)
+                "Fact-Memory",
+            )
 
-        # 2. تلخيص المواقف والسوالف (Episodic Memory) إذا كان الحوار يتضمن حدثاً أو سالفة
-        if len(recent_history) >= 4:
-            episode_prompt = f"""
+            # 2. تلخيص المواقف والسوالف (Episodic Memory) بالتوازي مع الحقائق لتقليل زمن المعالجة
+            if len(recent_history) >= 4:
+                episode_prompt = f"""
 أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري.
 حلل الحوار التالي بين المستخدم ({user_name}) وإينا:
 هل تضمن الحوار حدثاً، موقفاً، قصة، أو تجربة مر بها المستخدم تستحق أن تُحفظ كذكرى وسالفة مشتركة بينكما؟
@@ -735,47 +773,65 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 الحوار الأخير:
 {conversation}
 """
-            ep_result = await request_gemini(
-                MEMORY_MODELS,
-                MEMORY_GEMINI_API_KEY,
-                {
-                    "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": 200,
-                        "temperature": 0.2,
-                        "responseMimeType": "application/json",
-                    },
-                },
-                "Episode-Memory",
-            )
-            ep_data = parse_json_safely(ep_result)
-            if ep_data.get("has_episode") and ep_data.get("summary"):
-                summary = ep_data["summary"].strip()
-                topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
-                importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+                fact_result, ep_result = await asyncio.gather(
+                    fact_task,
+                    request_gemini(
+                        MEMORY_MODELS,
+                        MEMORY_GEMINI_API_KEY,
+                        {
+                            "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
+                            "generationConfig": {
+                                "maxOutputTokens": 200,
+                                "temperature": 0.2,
+                                "responseMimeType": "application/json",
+                            },
+                        },
+                        "Episode-Memory",
+                    ),
+                )
+            else:
+                fact_result = await fact_task
+                ep_result = None
 
-                async with db_pool.acquire() as connection:
-                    # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
-                    duplicate = await connection.fetchval(
-                        """
-                        SELECT 1 FROM episodes
-                        WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
-                        """,
-                        str(user_id),
-                        summary,
-                    )
-                    if not duplicate:
-                        await connection.execute(
+            fact_data = parse_json_safely(fact_result)
+            memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
+            saved_count = await save_memories(user_id, source_message_id, memories)
+            if saved_count:
+                print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.", flush=True)
+
+            if ep_result is not None:
+                ep_data = parse_json_safely(ep_result)
+                if ep_data.get("has_episode") and ep_data.get("summary"):
+                    summary = ep_data["summary"].strip()
+                    # تخزين المواضيع مطبَّعة حتى تطابق الكلمات المفتاحية المطبَّعة عند الاسترجاع
+                    raw_topics = " ".join(str(t) for t in ep_data.get("topics", []) if str(t).strip())
+                    topics = sorted(extract_keywords(raw_topics))
+                    importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+
+                    async with db_pool.acquire() as connection:
+                        # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
+                        duplicate = await connection.fetchval(
                             """
-                            INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
-                            VALUES ($1, $2, $3, $4, NOW())
+                            SELECT 1 FROM episodes
+                            WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
                             """,
                             str(user_id),
                             summary,
-                            topics,
-                            importance,
                         )
-                        print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}", flush=True)
+                        if not duplicate:
+                            await connection.execute(
+                                """
+                                INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
+                                VALUES ($1, $2, $3, $4, NOW())
+                                """,
+                                str(user_id),
+                                summary,
+                                topics,
+                                importance,
+                            )
+                            print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}", flush=True)
+        except Exception as error:
+            print(f"⚠️ [Memory] فشل تحديث ذاكرة المستخدم {user_name}: {error}", flush=True)
 
 
 # =========================================================
@@ -811,7 +867,7 @@ async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_mess
         },
         "Brain",
     )
-    return clean_text(result) or "هلا"
+    return clean_text(result) or random.choice(FALLBACK_REPLIES)
 
 
 # =========================================================
@@ -838,12 +894,17 @@ async def on_message(message):
     clean_prompt = re.sub(r"<@!?%s>" % client.user.id, "", message.content).strip() or "هلا"
 
     try:
-        await upsert_user(user_id, user_name)
-        user_message_id = await save_message(message.channel.id, user_id, "user", clean_prompt)
-        recent_history = await get_recent_history(message.channel.id, user_id)
+        # كتابة بيانات المستخدم فقط عند أول ظهور أو تغيّر الاسم، وقبل الرسالة بسبب المفتاح الأجنبي
+        if user_name_cache.get(user_id) != user_name:
+            await upsert_user(user_id, user_name)
+            user_name_cache[user_id] = user_name
 
-        # استرجاع الذكريات والمواقف بالترابط الدلالي البشري
-        cognitive_data = await get_associative_context(user_id, clean_prompt)
+        # حفظ الرسالة واسترجاع الذكريات بالتوازي (لا يعتمد أحدهما على الآخر)
+        user_message_id, cognitive_data = await asyncio.gather(
+            save_message(message.channel.id, user_id, "user", clean_prompt),
+            get_associative_context(user_id, clean_prompt),
+        )
+        recent_history = await get_recent_history(message.channel.id, user_id)
         cognitive_context = format_cognitive_context(user_name, cognitive_data)
 
         async with message.channel.typing():
@@ -866,9 +927,15 @@ async def on_message(message):
 # نقطة الدخول الرئيسية
 # =========================================================
 async def main():
-    await initialize_database()
-    await start_web_server()
-    await client.start(DISCORD_TOKEN)
+    global http_session
+    try:
+        await initialize_database()
+        await start_web_server()
+        await client.start(DISCORD_TOKEN)
+    finally:
+        # إغلاق جلسة aiohttp المشتركة عند الخروج
+        if http_session is not None:
+            await http_session.close()
 
 
 if __name__ == "__main__":
