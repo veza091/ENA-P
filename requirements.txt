@@ -1,5 +1,4 @@
 discord.py
 aiohttp
 python-dotenv
-motor
-dnspython
+asyncpg
