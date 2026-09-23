@@ -113,7 +113,7 @@ def bounded_setting(variable_name, default, minimum, maximum):
 
 MAIN_MODELS = configured_models(
     "MAIN_GEMINI_MODELS",
-    ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"],
+    ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
 )
 MEMORY_MODELS = configured_models(
     "MEMORY_GEMINI_MODELS",
@@ -647,35 +647,43 @@ async def request_gemini(models, api_key, payload, label):
                 "https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent"
             )
-            try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": api_key,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=12),
-                ) as response:
-                    if response.status != 200:
-                        err_text = await response.text()
-                        print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
-                        continue
-                    data = await response.json()
-                    candidates = data.get("candidates") or []
-                    if not candidates:
-                        block_reason = (data.get("promptFeedback") or {}).get("blockReason", "غير معروف")
-                        print(f"⚠️ [{label}] {model}: رجع بلا نتائج (blockReason: {block_reason})", flush=True)
-                        continue
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    result = "".join(part.get("text", "") for part in parts).strip()
-                    if result:
-                        last_good_model[label] = model
-                        return result, model
-                    finish_reason = candidates[0].get("finishReason", "غير معروف")
-                    print(f"⚠️ [{label}] {model}: نتيجة فارغة (finishReason: {finish_reason})", flush=True)
-            except Exception as error:
-                print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
+            # محاولتان كحد أقصى لكل نموذج: خطأ 503 (ازدحام مؤقت) يستحق إعادة محاولة بعد ثانيتين
+            for attempt in (1, 2):
+                try:
+                    async with session.post(
+                        url,
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": api_key,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=12),
+                    ) as response:
+                        if response.status == 503 and attempt == 1:
+                            print(f"⚠️ [{label}] {model}: ازدحام مؤقت (503) — إعادة المحاولة بعد ثانيتين...", flush=True)
+                            await asyncio.sleep(2)
+                            continue
+                        if response.status != 200:
+                            err_text = await response.text()
+                            print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
+                            break
+                        data = await response.json()
+                        candidates = data.get("candidates") or []
+                        if not candidates:
+                            block_reason = (data.get("promptFeedback") or {}).get("blockReason", "غير معروف")
+                            print(f"⚠️ [{label}] {model}: رجع بلا نتائج (blockReason: {block_reason})", flush=True)
+                            break
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        result = "".join(part.get("text", "") for part in parts).strip()
+                        if result:
+                            last_good_model[label] = model
+                            return result, model
+                        finish_reason = candidates[0].get("finishReason", "غير معروف")
+                        print(f"⚠️ [{label}] {model}: نتيجة فارغة (finishReason: {finish_reason})", flush=True)
+                        break
+                except Exception as error:
+                    print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
+                    break
     return None, None
 
 
@@ -920,4 +928,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 تم إيقاف البوت.", flush=True)
-
