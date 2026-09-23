@@ -1,8 +1,8 @@
 import asyncio
 import json
 import os
+import random
 import re
-import ssl
 import sys
 import urllib.parse
 from collections import defaultdict
@@ -122,8 +122,13 @@ MEMORY_MODELS = configured_models(
 
 HISTORY_LIMIT = bounded_setting("HISTORY_LIMIT", 10, 4, 30)
 
+# ردود احتياطية عفوية إذا رجع النموذج بنتيجة فارغة (بدل تكرار «هلا» الثابتة كل مرة)
+FALLBACK_REPLIES = ("هلا", "ايش؟", "قول", "اممم قل لي", "نعم؟")
+
 db_pool = None
 memory_locks = defaultdict(asyncio.Lock)
+# آخر نموذج نجح لكل نوع طلب: يُجرَّب أولاً في الطلب التالي بدل حرق المهلة على نموذج معطّل
+last_good_model = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -516,7 +521,7 @@ def format_cognitive_context(user_name, cognitive_data):
         sections.append(fact_text)
 
     if not sections:
-        return f"[لا توجد ذكريات سابقة بعد عن {user_name}]."
+        return ""
 
     return "\n\n".join(sections)
 
@@ -629,8 +634,15 @@ def valid_memory(memory):
 # Gemini: الاتصال واستخراج الذاكرة والمواقف
 # =========================================================
 async def request_gemini(models, api_key, payload, label):
+    # ابدأ بالنموذج الذي نجح آخر مرة: يوفر 12-20 ثانية كانت تُحرق على نموذج معطّل في كل رسالة
+    ordered = list(models)
+    last_good = last_good_model.get(label)
+    if last_good in ordered:
+        ordered.remove(last_good)
+        ordered.insert(0, last_good)
+
     async with aiohttp.ClientSession() as session:
-        for model in models:
+        for model in ordered:
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent"
@@ -643,20 +655,28 @@ async def request_gemini(models, api_key, payload, label):
                         "Content-Type": "application/json",
                         "x-goog-api-key": api_key,
                     },
-                    timeout=aiohttp.ClientTimeout(total=20),
+                    timeout=aiohttp.ClientTimeout(total=12),
                 ) as response:
                     if response.status != 200:
                         err_text = await response.text()
                         print(f"⚠️ [{label}] {model}: الحالة {response.status}: {err_text}", flush=True)
                         continue
                     data = await response.json()
-                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        block_reason = (data.get("promptFeedback") or {}).get("blockReason", "غير معروف")
+                        print(f"⚠️ [{label}] {model}: رجع بلا نتائج (blockReason: {block_reason})", flush=True)
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
                     result = "".join(part.get("text", "") for part in parts).strip()
                     if result:
-                        return result
+                        last_good_model[label] = model
+                        return result, model
+                    finish_reason = candidates[0].get("finishReason", "غير معروف")
+                    print(f"⚠️ [{label}] {model}: نتيجة فارغة (finishReason: {finish_reason})", flush=True)
             except Exception as error:
                 print(f"⚠️ [{label}] تعذر الاتصال بـ {model}: {error}", flush=True)
-    return None
+    return None, None
 
 
 def parse_json_safely(text):
@@ -683,13 +703,14 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
         return
 
     async with memory_locks[str(user_id)]:
-        conversation = "\n".join(
-            f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
-            for message in recent_history
-        )
+        try:
+            conversation = "\n".join(
+                f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
+                for message in recent_history
+            )
 
-        # 1. استخراج حقائق الذاكرة الدائمة
-        fact_prompt = f"""
+            # 1. استخراج حقائق الذاكرة الدائمة
+            fact_prompt = f"""
 أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name}.
 لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
 
@@ -699,28 +720,28 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 المحادثة الأخيرة:
 {conversation}
 """
-        fact_result = await request_gemini(
-            MEMORY_MODELS,
-            MEMORY_GEMINI_API_KEY,
-            {
-                "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 250,
-                    "temperature": 0.1,
-                    "responseMimeType": "application/json",
+            fact_result, fact_model = await request_gemini(
+                MEMORY_MODELS,
+                MEMORY_GEMINI_API_KEY,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 250,
+                        "temperature": 0.1,
+                        "responseMimeType": "application/json",
+                    },
                 },
-            },
-            "Fact-Memory",
-        )
-        fact_data = parse_json_safely(fact_result)
-        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
-        saved_count = await save_memories(user_id, source_message_id, memories)
-        if saved_count:
-            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.", flush=True)
+                "Fact-Memory",
+            )
+            fact_data = parse_json_safely(fact_result)
+            memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
+            saved_count = await save_memories(user_id, source_message_id, memories)
+            if saved_count:
+                print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name} (النموذج: {fact_model}).", flush=True)
 
-        # 2. تلخيص المواقف والسوالف (Episodic Memory) إذا كان الحوار يتضمن حدثاً أو سالفة
-        if len(recent_history) >= 4:
-            episode_prompt = f"""
+            # 2. تلخيص المواقف والسوالف (Episodic Memory) إذا كان الحوار يتضمن حدثاً أو سالفة
+            if len(recent_history) >= 4:
+                episode_prompt = f"""
 أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري.
 حلل الحوار التالي بين المستخدم ({user_name}) وإينا:
 هل تضمن الحوار حدثاً، موقفاً، قصة، أو تجربة مر بها المستخدم تستحق أن تُحفظ كذكرى وسالفة مشتركة بينكما؟
@@ -735,61 +756,72 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 الحوار الأخير:
 {conversation}
 """
-            ep_result = await request_gemini(
-                MEMORY_MODELS,
-                MEMORY_GEMINI_API_KEY,
-                {
-                    "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": 200,
-                        "temperature": 0.2,
-                        "responseMimeType": "application/json",
+                ep_result, _ep_model = await request_gemini(
+                    MEMORY_MODELS,
+                    MEMORY_GEMINI_API_KEY,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
+                        "generationConfig": {
+                            "maxOutputTokens": 200,
+                            "temperature": 0.2,
+                            "responseMimeType": "application/json",
+                        },
                     },
-                },
-                "Episode-Memory",
-            )
-            ep_data = parse_json_safely(ep_result)
-            if ep_data.get("has_episode") and ep_data.get("summary"):
-                summary = ep_data["summary"].strip()
-                topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
-                importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+                    "Episode-Memory",
+                )
+                ep_data = parse_json_safely(ep_result)
+                if ep_data.get("has_episode") and ep_data.get("summary"):
+                    summary = ep_data["summary"].strip()
+                    topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
+                    importance = max(1, min(int(ep_data.get("importance", 5)), 10))
 
-                async with db_pool.acquire() as connection:
-                    # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
-                    duplicate = await connection.fetchval(
-                        """
-                        SELECT 1 FROM episodes
-                        WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
-                        """,
-                        str(user_id),
-                        summary,
-                    )
-                    if not duplicate:
-                        await connection.execute(
+                    async with db_pool.acquire() as connection:
+                        # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
+                        duplicate = await connection.fetchval(
                             """
-                            INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
-                            VALUES ($1, $2, $3, $4, NOW())
+                            SELECT 1 FROM episodes
+                            WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
                             """,
                             str(user_id),
                             summary,
-                            topics,
-                            importance,
                         )
-                        print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}", flush=True)
+                        if not duplicate:
+                            await connection.execute(
+                                """
+                                INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
+                                VALUES ($1, $2, $3, $4, NOW())
+                                """,
+                                str(user_id),
+                                summary,
+                                topics,
+                                importance,
+                            )
+                            print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}", flush=True)
+        except Exception as error:
+            print(f"⚠️ [Memory] فشل تحديث ذاكرة المستخدم {user_name}: {error}", flush=True)
 
 
 # =========================================================
 # Gemini: الرد الرئيسي البشري
 # =========================================================
 async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_messages):
-    system_instruction = (
-        "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
-        "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
-        "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n\n"
-        f"{cognitive_context}\n\n"
-        "تذكري واستحضري المواقف والأشياء السابقة بينكما كما يفعل الأصدقاء بعفوية ودون افتعال. "
-        "لا تختلقي قصصاً وهمية، ولا تسردي الذكريات بشكل آلي دفعة واحدة."
+    persona = (
+        "أنتِ إينا، بنت عمرك 18 سنة. هادية بطبيعتك، ملاحظة وواعية باللي يحصل حواليك، "
+        "وتتكلم بعفوية ودون افتعال. لسانتك خفيفة وفيها لمسة سوداوية أحياناً — "
+        "ما هي ساذجة ولا تبالغ في الفرح. تتذكر الأمور بعمق وتتكلم عنها بعفوية. "
+        "ردي بجملة إلى جملتين، طبيعي كأنك تكتبين لصديق قريب. "
+        "طابقي لهجة المستخدم وأسلوب حديثه. "
+        "إيموجي واحد كحد أقصى، وبوصفه تعبيراً عفوياً فقط — مش كزينة أو تزيين."
     )
+    if cognitive_context:
+        persona += f"\n\n{cognitive_context}\n\nتذكري واستحضري المواقف والأشياء السابقة بينكما كذكريات شخصية عابرة، وذكرها بعفوية دون تقول 'أنا أتذكر'."
+    persona += (
+        "\n\nقواعد مهمة: "
+        "أجبي مباشرة على آخر رسالة قالها المستخدم ولا تتجاهليها، "
+        "لا تختلقي قصصاً وهمية، "
+        "ولا تكرري نفس ردك السابق حرفياً."
+    )
+    system_instruction = persona
 
     contents = [
         {
@@ -801,17 +833,29 @@ async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_mess
     if not contents or contents[-1]["parts"][0]["text"] != clean_prompt:
         contents.append({"role": "user", "parts": [{"text": clean_prompt}]})
 
-    result = await request_gemini(
-        MAIN_MODELS,
-        MAIN_GEMINI_API_KEY,
-        {
+    def brain_payload(temperature):
+        return {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
             "contents": contents,
-            "generationConfig": {"maxOutputTokens": 60, "temperature": 0.75, "topP": 0.9},
-        },
-        "Brain",
+            "generationConfig": {"maxOutputTokens": 150, "temperature": temperature, "topP": 0.9},
+        }
+
+    # آخر رد قاله البوت: لو ردّ بنفس الحرف نعيد المحاولة بدرجة حرارة أعلى حتى لا يبدو آلياً
+    last_model_reply = next(
+        (m["content"] for m in reversed(history_messages) if m["role"] == "model"),
+        None,
     )
-    return clean_text(result) or "هلا"
+    result, model = None, None
+    for temperature in (0.85, 1.05):
+        result, model = await request_gemini(MAIN_MODELS, MAIN_GEMINI_API_KEY, brain_payload(temperature), "Brain")
+        result = clean_text(result) if result else ""
+        if result and result != last_model_reply:
+            break
+
+    if result:
+        print(f"💬 [Brain] الرد من: {model}", flush=True)
+        return result
+    return random.choice(FALLBACK_REPLIES)
 
 
 # =========================================================
