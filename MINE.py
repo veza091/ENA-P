@@ -28,7 +28,10 @@ if not DISCORD_TOKEN or not MAIN_GEMINI_API_KEY:
     sys.exit(1)
 
 db_pool = None
+http_session = None
 memory_locks = defaultdict(asyncio.Lock)
+# آخر اسم معروف لكل مستخدم: لا نكتب سطر المستخدمين في القاعدة إلا عند أول ظهور أو تغيّر الاسم
+user_name_cache = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -641,7 +644,7 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 المحادثة الأخيرة:
 {conversation}
 """
-        fact_result = await request_gemini(
+        fact_task = request_gemini(
             MEMORY_MODELS,
             MEMORY_GEMINI_API_KEY,
             {
@@ -654,13 +657,8 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
             },
             "Memory",
         )
-        fact_data = parse_json_safely(fact_result)
-        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
-        saved_count = await save_memories(user_id, source_message_id, memories)
-        if saved_count:
-            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
 
-        # 2. تلخيص المواقف والسوالف (Episodic Memory) إذا كان الحوار يتضمن حدثاً أو سالفة
+        # 2. تلخيص المواقف والسوالف (Episodic Memory) بالتوازي مع الحقائق لتقليل زمن المعالجة
         if len(recent_history) >= 4:
             episode_prompt = f"""
 أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري.
@@ -677,19 +675,34 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 الحوار الأخير:
 {conversation}
 """
-            ep_result = await request_gemini(
-                MEMORY_MODELS,
-                MEMORY_GEMINI_API_KEY,
-                {
-                    "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": 200,
-                        "temperature": 0.2,
-                        "responseMimeType": "application/json",
+            fact_result, ep_result = await asyncio.gather(
+                fact_task,
+                request_gemini(
+                    MEMORY_MODELS,
+                    MEMORY_GEMINI_API_KEY,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
+                        "generationConfig": {
+                            "maxOutputTokens": 200,
+                            "temperature": 0.2,
+                            "responseMimeType": "application/json",
+                        },
                     },
-                },
-                "Memory",
+                    "Memory",
+                ),
             )
+        else:
+            fact_result = await fact_task
+            ep_result = None
+
+        fact_data = parse_json_safely(fact_result)
+        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
+        saved_count = await save_memories(user_id, source_message_id, memories)
+        if saved_count:
+            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
+
+        # معالجة نتيجة الموقف (إن كان قد طُلب)
+        if ep_result is not None:
             ep_data = parse_json_safely(ep_result)
             if ep_data.get("has_episode") and ep_data.get("summary"):
                 summary = ep_data["summary"].strip()
@@ -723,27 +736,36 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 # ==========================================
 # 5. الاتصال المباشر بـ Gemini (المخ الرئيسي)
 # ==========================================
+async def get_http_session():
+    """جلسة aiohttp واحدة مشتركة لإعادة استخدام الاتصالات بدل فتح جلسة جديدة لكل طلب."""
+    global http_session
+    if http_session is None or http_session.closed:
+        connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, keepalive_timeout=60)
+        http_session = aiohttp.ClientSession(connector=connector)
+    return http_session
+
+
 async def request_gemini(models, api_key, payload, label):
-    async with aiohttp.ClientSession() as session:
-        for model in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            try:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get('candidates', [])
-                        if not candidates:
-                            continue
-                        parts = candidates[0].get('content', {}).get('parts', [])
-                        result = "".join(p.get('text', '') for p in parts).strip()
-                        if result:
-                            return result
-                    else:
-                        err_body = await resp.text()
-                        print(f"⚠️ [{label}] النموذج {model} رد بالحالة {resp.status}: {err_body}")
-            except Exception as e:
-                print(f"⚠️ [{label}] خطأ أثناء الاتصال بالنموذج {model}: {e}")
-                continue
+    session = await get_http_session()
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        try:
+            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candidates = data.get('candidates', [])
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    result = "".join(p.get('text', '') for p in parts).strip()
+                    if result:
+                        return result
+                else:
+                    err_body = await resp.text()
+                    print(f"⚠️ [{label}] النموذج {model} رد بالحالة {resp.status}: {err_body}")
+        except Exception as e:
+            print(f"⚠️ [{label}] خطأ أثناء الاتصال بالنموذج {model}: {e}")
+            continue
     return None
 
 
@@ -822,9 +844,16 @@ async def on_message(message):
 
         print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
 
-        # 1. حفظ رسالة المستخدم وجلب سجل المحادثة القريب
-        await upsert_user(user_id, user_name)
-        user_message_id = await save_message(message.channel.id, user_id, "user", clean_prompt)
+        # 1. كتابة بيانات المستخدم فقط عند أول ظهور أو تغيّر الاسم (قبل الرسالة بسبب المفتاح الأجنبي)
+        if user_name_cache.get(user_id) != user_name:
+            await upsert_user(user_id, user_name)
+            user_name_cache[user_id] = user_name
+
+        # حفظ الرسالة واسترجاع الذكريات بالتوازي (لا يعتمد أحدهما على الآخر)
+        user_message_id, cognitive_data = await asyncio.gather(
+            save_message(message.channel.id, user_id, "user", clean_prompt),
+            get_associative_context(user_id, clean_prompt),
+        )
         recent_history = await get_recent_history(message.channel.id, user_id)
 
         # 2. استرجاع الذكريات والمواقف بالترابط الدلالي البشري
@@ -847,9 +876,15 @@ async def on_message(message):
 
 
 async def main():
-    await initialize_database()
-    await start_web_server()
-    await client.start(DISCORD_TOKEN)
+    global http_session
+    try:
+        await initialize_database()
+        await start_web_server()
+        await client.start(DISCORD_TOKEN)
+    finally:
+        # إغلاق جلسة aiohttp المشتركة عند الخروج
+        if http_session is not None:
+            await http_session.close()
 
 if __name__ == "__main__":
     try:
