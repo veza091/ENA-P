@@ -1,10 +1,17 @@
-import sys
 import asyncio
-import discord
+import json
+import os
+import re
+import sys
+import urllib.parse
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+
 import aiohttp
+import asyncpg
+import discord
 from aiohttp import web
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
 
 # تحميل متغيرات البيئة
 load_dotenv()
@@ -12,23 +19,16 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 MAIN_GEMINI_API_KEY = (os.getenv('MAIN_GEMINI_API_KEY') or os.getenv('GEMINI_API_KEY') or "").strip()
 MEMORY_GEMINI_API_KEY = (os.getenv('MEMORY_GEMINI_API_KEY') or MAIN_GEMINI_API_KEY).strip()
 
-MONGODB_URI = os.getenv('MONGODB_URI', '').strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_SSL_ENV = os.getenv("DATABASE_SSL", "").strip().lower()
+DATABASE_SSL = DATABASE_SSL_ENV in {"1", "true", "yes"} or "supabase" in DATABASE_URL
 
 if not DISCORD_TOKEN or not MAIN_GEMINI_API_KEY:
     print("❌ خطأ: لم يتم العثور على المتغيرات الأساسية (DISCORD_TOKEN أو MAIN_GEMINI_API_KEY) في البيئة!")
     sys.exit(1)
 
-# إعداد عميل MongoDB (NoSQL)
-db = None
-if MONGODB_URI:
-    try:
-        mongo_client = AsyncIOMotorClient(MONGODB_URI)
-        db = mongo_client["ena_bot_db"]
-        print("⚡ [MongoDB] تم الاتصال بقاعدة البيانات بنجاح.")
-    except Exception as e:
-        print(f"⚠️ [MongoDB Warning] فشل الاتصال بقاعدة البيانات: {e}")
-else:
-    print("⚠️ [MongoDB Warning] لم يتم توفير رابط الاتصال بـ MongoDB. ستعمل الذاكرة مؤقتاً بدون حفظ دائم.")
+db_pool = None
+memory_locks = defaultdict(asyncio.Lock)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -53,6 +53,8 @@ MEMORY_MODELS = [
     "gemini-3.5-flash-lite"
 ]
 
+HISTORY_LIMIT = 10
+
 def clean_text(text):
     if not text:
         return ""
@@ -60,6 +62,103 @@ def clean_text(text):
     text = re.sub(r'[\*\-_•#@\$%\^&\(\)]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+def sanitize_database_url(url):
+    """ينظف الرابط تلقائياً من الأقواس المربعة [ ] التي يتركها المستخدمون سهواً من قالب Supabase."""
+    if not url:
+        return url
+    url = url.strip()
+    if (url.startswith('"') and url.endswith('"')) or (url.startswith("'") and url.endswith("'")):
+        url = url[1:-1].strip()
+
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    elif not url.startswith("postgresql://"):
+        return url
+
+    rest = url[len("postgresql://"):]
+    slash_idx = rest.find("/")
+    authority = rest[:slash_idx] if slash_idx != -1 else rest
+    path_and_query = rest[slash_idx:] if slash_idx != -1 else ""
+
+    at_idx = authority.rfind("@")
+    if at_idx != -1:
+        userinfo = authority[:at_idx]
+        hostinfo = authority[at_idx + 1:]
+
+        colon_idx = userinfo.find(":")
+        if colon_idx != -1:
+            user = userinfo[:colon_idx]
+            pwd = userinfo[colon_idx + 1:]
+        else:
+            user = userinfo
+            pwd = ""
+
+        # إزالة الأقواس المربعة من المستخدم أو كلمة المرور
+        if pwd.startswith("[") and pwd.endswith("]"):
+            pwd = pwd[1:-1]
+        pwd = pwd.replace("[", "").replace("]", "")
+
+        if user.startswith("[") and user.endswith("]"):
+            user = user[1:-1]
+        user = user.replace("[", "").replace("]", "")
+
+        # إزالة الأقواس المربعة حول المضيف إن وجدت
+        if hostinfo.startswith("[") and hostinfo.endswith("]"):
+            hostinfo = hostinfo[1:-1]
+        host_parts = hostinfo.split(":")
+        if len(host_parts) == 2 and host_parts[0].startswith("[") and host_parts[0].endswith("]"):
+            hostinfo = f"{host_parts[0][1:-1]}:{host_parts[1]}"
+
+        pwd_encoded = urllib.parse.quote(urllib.parse.unquote(pwd), safe="")
+        user_encoded = urllib.parse.quote(urllib.parse.unquote(user), safe=".")
+
+        return f"postgresql://{user_encoded}:{pwd_encoded}@{hostinfo}{path_and_query}"
+    return url
+
+
+# كلمات شائعة للتجاهل عند استخراج الكلمات المفتاحية
+STOP_WORDS = {
+    "انا", "أنا", "هو", "هي", "هم", "نحن", "انت", "أنت", "في", "من", "إلى", "على", "عن", "مع",
+    "هذا", "هذه", "تم", "كان", "كنت", "ما", "لا", "لم", "لن", "هل", "وش", "ليه", "كيف", "وين",
+    "اللي", "الي", "يلي", "شو", "بدك", "بس", "كل", "يا", "ان", "أن", "إن", "او", "أو", "ثم",
+    "بعد", "قبل", "حتى", "إذا", "اذا", "عشان", "عشا", "لأنه", "لانه", "هيك", "كذا", "طيب"
+}
+
+
+def extract_keywords(text):
+    """يستخرج الكلمات الدلالية الهامة من الحديث للربط التلقائي بالذاكرة."""
+    if not text:
+        return set()
+    words = re.findall(r"[\w\u0600-\u06FF]+", text.lower())
+    return {w for w in words if len(w) > 2 and w not in STOP_WORDS}
+
+
+def human_time_ago(occurred_at):
+    """يحول تاريخ الموقف إلى صيغة بشرية عفوية (أمس، قبل يومين، الأسبوع الماضي)."""
+    now = datetime.now(timezone.utc)
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    diff = now - occurred_at
+    days = diff.days
+    seconds = diff.seconds
+
+    if days == 0:
+        if seconds < 7200:
+            return "اليوم (قبل قليل)"
+        return "اليوم"
+    elif days == 1:
+        return "أمس"
+    elif days == 2:
+        return "قبل يومين"
+    elif 3 <= days <= 10:
+        return f"قبل {days} أيام"
+    elif 11 <= days <= 30:
+        return "قبل أسبوعين أو ثلاثة"
+    else:
+        return "من فترة"
+
 
 # ==========================================
 # 1. خادم الويب (لإبقاء Render نشطاً)
@@ -77,126 +176,578 @@ async def start_web_server():
     await web.TCPSite(runner, '0.0.0.0', port).start()
     print(f"🌐 [Web Server] يعمل على المنفذ: {port}")
 
-# ==========================================
-# 2. دوال التعامل مع قاعدة البيانات (MongoDB - NoSQL)
-# ==========================================
-async def get_user_profile_db(user_id, user_name):
-    if db is None:
-        return {"core_facts": "", "msg_count": 0}
-    try:
-        profile = await db.user_profiles.find_one({"user_id": str(user_id)})
-        if profile:
-            return profile
-        else:
-            new_profile = {"user_id": str(user_id), "user_name": user_name, "core_facts": "", "msg_count": 0}
-            await db.user_profiles.insert_one(new_profile)
-            return new_profile
-    except Exception as e:
-        print(f"⚠️ [DB Error - get_user_profile]: {e}")
-        return {"core_facts": "", "msg_count": 0}
 
-async def save_message_db(channel_id, user_id, user_name, role, content):
-    if db is None:
+# ==========================================
+# 2. PostgreSQL: الذاكرة المعرفية البشرية
+# ==========================================
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    discord_user_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'model')),
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS messages_user_channel_created_idx
+    ON messages (discord_user_id, channel_id, created_at DESC);
+
+-- ذاكرة الحقائق مع الرسوخ والنسيان التدريجي
+CREATE TABLE IF NOT EXISTS memories (
+    id BIGSERIAL PRIMARY KEY,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    memory_key TEXT NOT NULL,
+    memory_value TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'profile',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7
+        CHECK (confidence >= 0 AND confidence <= 1),
+    strength DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    recall_count INT NOT NULL DEFAULT 1,
+    last_recalled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    previous_value TEXT,
+    source_message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (discord_user_id, memory_key)
+);
+
+-- ترقية الأعمدة للجدول إذا كان منشأ مسبقاً
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS strength DOUBLE PRECISION NOT NULL DEFAULT 1.0;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS recall_count INT NOT NULL DEFAULT 1;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS previous_value TEXT;
+
+CREATE INDEX IF NOT EXISTS memories_user_updated_idx
+    ON memories (discord_user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS memories_user_strength_idx
+    ON memories (discord_user_id, strength DESC, last_recalled_at DESC);
+
+-- ذاكرة المواقف والسوالف (Episodic Memory)
+CREATE TABLE IF NOT EXISTS episodes (
+    id BIGSERIAL PRIMARY KEY,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    topics TEXT[] NOT NULL DEFAULT '{}',
+    importance INT NOT NULL DEFAULT 5 CHECK (importance BETWEEN 1 AND 10),
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS episodes_user_occurred_idx
+    ON episodes (discord_user_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS episodes_user_importance_idx
+    ON episodes (discord_user_id, importance DESC);
+
+-- حماية RLS لجميع الجداول
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE episodes ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON TABLE users, messages, memories, episodes FROM anon;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON TABLE users, messages, memories, episodes FROM authenticated;
+    END IF;
+END $$;
+"""
+
+
+async def initialize_database():
+    """يفتح اتصالاً بـ Supabase Postgres وينشئ أو يرقّي الجداول والفهارس."""
+    global db_pool
+
+    if not DATABASE_URL:
+        print("❌ [Postgres] لم يتم العثور على DATABASE_URL في متغيرات البيئة! الذاكرة الدائمة لن تعمل.", flush=True)
         return
-    try:
-        await db.conversations.insert_one({
-            "channel_id": str(channel_id),
-            "user_id": str(user_id),
-            "user_name": user_name,
-            "role": role,
-            "content": content,
-            "created_at": asyncio.get_event_loop().time()
-        })
-    except Exception as e:
-        print(f"⚠️ [DB Error - save_message]: {e}")
 
-async def get_recent_history_db(channel_id, limit=8):
-    if db is None:
-        return []
-    try:
-        cursor = db.conversations.find({"channel_id": str(channel_id)}).sort("_id", -1).limit(limit)
-        messages = await cursor.to_list(length=limit)
-        return messages[::-1]
-    except Exception as e:
-        print(f"⚠️ [DB Error - get_recent_history]: {e}")
-        return []
+    cleaned_dsn = sanitize_database_url(DATABASE_URL)
+    if cleaned_dsn != DATABASE_URL:
+        print("💡 [Postgres] تم تنظيف رابط DATABASE_URL وإزالة الأقواس المربعة [ ] الزائدة تلقائياً.", flush=True)
 
-async def update_user_memory_db(user_id, user_name, new_facts, new_count=None):
-    if db is None:
-        return
-    try:
-        payload = {
-            "user_name": user_name,
-            "core_facts": new_facts,
-            "last_active": asyncio.get_event_loop().time()
-        }
-        if new_count is not None:
-            payload["msg_count"] = new_count
-        await db.user_profiles.update_one(
-            {"user_id": str(user_id)},
-            {"$set": payload},
-            upsert=True
-        )
-    except Exception as e:
-        print(f"⚠️ [DB Error - update_user_memory]: {e}")
+    if "[" in DATABASE_URL or "]" in DATABASE_URL:
+        print("⚠️ [Postgres تنبيه] لاحظنا وجود أقواس مربعة '[' أو ']' في DATABASE_URL الأصلي على Render!\n"
+              "   يرجى مسح الأقواس المربعة حول كلمة المرور أو معرّف المشروع في Render Environment.", flush=True)
 
-# ==========================================
-# 3. المصفاة الذهنية في الخلفية (Memory Filter)
-# ==========================================
-async def run_memory_filter_background(user_id, user_name, recent_chat_text, current_facts):
-    """تحليل الحوار في الخلفية باستخدام مفتاح الذاكرة المخصص ونماذج الذاكرة المستقلة"""
-    if not MEMORY_GEMINI_API_KEY:
-        return
-
-    prompt_filter = f"""
-    أنت مصفاة ذكاء اصطناعي واعية ومباشرة. وظيفتك استخراج وتحديث الحقائق الانطباعية الثابتة عن المستخدم ({user_name}).
-
-    الحقائق والبروفايل المسجل حالياً عن المستخدم:
-    {current_facts if current_facts else "لا توجد حقائق سابقة مسجلة."}
-
-    المحادثة الأخيرة:
-    {recent_chat_text}
-
-    المطلوب منك:
-    1. استخرج أي حقائق سريعة أو ثابتة ظهرت عن المستخدم (نظامه، اهتماماته، بيئة عمله، أسلوبه).
-    2. قانون الإحلال: إذا ذكر المستخدم معلومة مناقضة لحقيقة قديمة، احذف الحقيقة القديمة تماماً واكتب الجديدة مكانها.
-    3. تجاهل التحيات واللغو والدردشة العابرة.
-    4. اكتب النتيجة النهائية في هيئة نقاط مختصرة جداً بدون أي مقدمات أو شرح.
-    """
-
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt_filter}]}],
-        "generationConfig": {
-            "maxOutputTokens": 200,
-            "temperature": 0.2
-        }
+    pool_options = {
+        "min_size": 1,
+        "max_size": 5,
+        "command_timeout": 15,
+        "statement_cache_size": 0,
     }
 
+    if DATABASE_SSL:
+        pool_options["ssl"] = "require"
+
+    print("🔌 [Postgres] جاري الاتصال بقاعدة البيانات وتجهيز نظام الذاكرة المعرفية...", flush=True)
+
+    for attempt in range(1, 4):
+        try:
+            db_pool = await asyncpg.create_pool(cleaned_dsn, **pool_options)
+            async with db_pool.acquire() as connection:
+                await connection.execute("SELECT 1")
+                await connection.execute(SCHEMA_SQL)
+            print("✅ [Postgres] تم تجهيز جداول الذاكرة البشرية (الحقائق، المواقف، الرسوخ) وحمايتها بـ RLS.", flush=True)
+            return
+        except Exception as error:
+            print(f"⚠️ [Postgres] المحاولة {attempt}/3 فشلت: {error}", flush=True)
+            if db_pool:
+                await db_pool.close()
+                db_pool = None
+            if attempt < 3:
+                await asyncio.sleep(2)
+            else:
+                print(
+                    "❌ [Postgres] تعذر الاتصال نهائياً بقاعدة البيانات!\n"
+                    "   تأكد من صحة DATABASE_URL وصحة كلمة المرور بدون أقواس [].",
+                    flush=True,
+                )
+
+
+async def upsert_user(user_id, user_name):
+    if db_pool is None:
+        return
+    async with db_pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO users (discord_user_id, display_name)
+            VALUES ($1, $2)
+            ON CONFLICT (discord_user_id) DO UPDATE
+            SET display_name = EXCLUDED.display_name, updated_at = NOW()
+            """,
+            str(user_id),
+            user_name,
+        )
+
+
+async def save_message(channel_id, user_id, role, content):
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as connection:
+        return await connection.fetchval(
+            """
+            INSERT INTO messages (channel_id, discord_user_id, role, content)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            """,
+            str(channel_id),
+            str(user_id),
+            role,
+            content,
+        )
+
+
+async def get_recent_history(channel_id, user_id, limit=HISTORY_LIMIT):
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE channel_id = $1 AND discord_user_id = $2
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            """,
+            str(channel_id),
+            str(user_id),
+            limit,
+        )
+    return list(reversed(rows))
+
+
+# ==========================================
+# 3. محرك الاستدعاء بالترابط والنسيان البشري (Associative Retrieval)
+# ==========================================
+async def get_associative_context(user_id, current_prompt):
+    """
+    يسترجع الذكريات والمواقف المرتبطة بسياق ما يقال الآن فقط (مثل عقل الإنسان).
+    يطبق معادلة النسيان الطبيعي (Decay Formula) ويعزز قوة ما يتم استرجاعه.
+    """
+    if db_pool is None:
+        return {"memories": [], "episodes": []}
+
+    prompt_keywords = extract_keywords(current_prompt)
+
+    async with db_pool.acquire() as connection:
+        # 1. استرجاع ذاكرة الحقائق المحسوبة بالرسوخ وتلاشي النسيان
+        raw_memories = await connection.fetch(
+            """
+            SELECT memory_key, memory_value, category, confidence, strength,
+                   recall_count, previous_value,
+                   -- معادلة النسيان البشري: يقل الوزن تدريجياً إذا لم تُذكر منذ فترة
+                   (confidence * (strength / (1.0 + 0.04 * GREATEST(0, EXTRACT(EPOCH FROM (NOW() - last_recalled_at)) / 86400.0)))) AS effective_score
+            FROM memories
+            WHERE discord_user_id = $1
+            ORDER BY effective_score DESC
+            LIMIT 20
+            """,
+            str(user_id),
+        )
+
+        selected_memories = []
+        recalled_keys = []
+
+        for row in raw_memories:
+            key = row["memory_key"]
+            val = row["memory_value"]
+            cat = row["category"]
+
+            # معلومات الملف الأساسية تبقى موجودة دائماً
+            is_core = cat in {"profile", "identity"} or "name" in key
+            # فحص إذا كانت الذكرى مرتبطة بمواضيع الرسالة الحالية
+            val_words = set(re.findall(r"[\w\u0600-\u06FF]+", val.lower()))
+            matches_topic = bool(prompt_keywords & val_words)
+
+            if is_core or matches_topic or len(selected_memories) < 4:
+                selected_memories.append(dict(row))
+                recalled_keys.append(key)
+                if len(selected_memories) >= 6:
+                    break
+
+        # تعزيز الذكريات التي تم استدعاؤها في عقل البوت الآن (Reconsolidation)
+        if recalled_keys:
+            await connection.execute(
+                """
+                UPDATE memories
+                SET recall_count = recall_count + 1, last_recalled_at = NOW()
+                WHERE discord_user_id = $1 AND memory_key = ANY($2)
+                """,
+                str(user_id),
+                recalled_keys,
+            )
+
+        # 2. استرجاع ذاكرة المواقف والسوالف السابقة (Episodic Memory)
+        raw_episodes = await connection.fetch(
+            """
+            SELECT id, summary, topics, importance, occurred_at
+            FROM episodes
+            WHERE discord_user_id = $1
+            ORDER BY occurred_at DESC
+            LIMIT 5
+            """,
+            str(user_id),
+        )
+
+        selected_episodes = []
+        for ep in raw_episodes:
+            ep_topics = set(ep["topics"] or [])
+            # جلب آخر موقف حدث دائماً (لسياق المرة السابقة) أو المواقف المرتبطة بالسالفة الحالية
+            if not selected_episodes or bool(prompt_keywords & ep_topics):
+                selected_episodes.append({
+                    "summary": ep["summary"],
+                    "time_ago": human_time_ago(ep["occurred_at"]),
+                    "importance": ep["importance"],
+                })
+                if len(selected_episodes) >= 2:
+                    break
+
+        return {
+            "memories": selected_memories,
+            "episodes": selected_episodes,
+        }
+
+
+def format_cognitive_context(user_name, cognitive_data):
+    """يصيغ الذكريات والمواقف بأسلوب أفكار ذهنية بشرية طبيعية داخل البرومبت."""
+    memories = cognitive_data.get("memories", [])
+    episodes = cognitive_data.get("episodes", [])
+
+    sections = []
+
+    # 1. المواقف السابقة
+    if episodes:
+        ep_lines = [f"- {ep['time_ago']}: {ep['summary']}" for ep in episodes]
+        sections.append(f"[مواقف وأحداث مشتركة سابقة بينكما]:\n" + "\n".join(ep_lines))
+
+    # 2. الحقائق الحاضرة في الذهن وتنبيهات التغير والتناقض
+    if memories:
+        mem_lines = []
+        contradictions = []
+        for mem in memories:
+            mem_lines.append(f"- {mem['memory_key']}: {mem['memory_value']}")
+            if mem.get("previous_value"):
+                contradictions.append(
+                    f"(ملاحظة تغير: كان يقول سابقاً إنه '{mem['previous_value']}' والآن يقول '{mem['memory_value']}' - يمكنك التعليق باستغراب خفيف إذا ناسب السياق)"
+                )
+
+        fact_text = f"[أشياء في ذهنك عن {user_name} ترتبط بكلامه الآن]:\n" + "\n".join(mem_lines)
+        if contradictions:
+            fact_text += "\n" + "\n".join(contradictions)
+        sections.append(fact_text)
+
+    if not sections:
+        return ""
+
+    return "\n\n".join(sections)
+
+
+async def save_memories(user_id, source_message_id, memories):
+    """يحفظ ويحدث الحقائق مع رصد التناقضات وزيادة قوة الرسوخ بالتكرار."""
+    if db_pool is None or not memories:
+        return 0
+
+    saved_count = 0
+    async with db_pool.acquire() as connection:
+        async with connection.transaction():
+            for memory in memories:
+                if not valid_memory(memory):
+                    continue
+
+                # فحص القيمة القديمة لمعرفة ما إذا كان هناك تغير أو تناقض
+                existing = await connection.fetchrow(
+                    """
+                    SELECT memory_value, strength, recall_count
+                    FROM memories
+                    WHERE discord_user_id = $1 AND memory_key = $2
+                    """,
+                    str(user_id),
+                    memory["key"],
+                )
+
+                if existing:
+                    old_val = existing["memory_value"]
+                    if old_val != memory["value"]:
+                        # تغير الرأي: تسجيل التناقض وإعادة ضبط القوة
+                        await connection.execute(
+                            """
+                            UPDATE memories
+                            SET memory_value = $3,
+                                previous_value = $4,
+                                category = $5,
+                                confidence = $6,
+                                strength = 2.0,
+                                recall_count = recall_count + 1,
+                                source_message_id = $7,
+                                updated_at = NOW(),
+                                last_recalled_at = NOW()
+                            WHERE discord_user_id = $1 AND memory_key = $2
+                            """,
+                            str(user_id),
+                            memory["key"],
+                            memory["value"],
+                            old_val,
+                            memory["category"],
+                            memory["confidence"],
+                            source_message_id,
+                        )
+                    else:
+                        # تأكيد وتكرار: زيادة الرسوخ البشري
+                        await connection.execute(
+                            """
+                            UPDATE memories
+                            SET strength = LEAST(10.0, strength + 1.0),
+                                recall_count = recall_count + 1,
+                                source_message_id = $3,
+                                updated_at = NOW(),
+                                last_recalled_at = NOW()
+                            WHERE discord_user_id = $1 AND memory_key = $2
+                            """,
+                            str(user_id),
+                            memory["key"],
+                            source_message_id,
+                        )
+                else:
+                    # ذكرى جديدة لأول مرة
+                    await connection.execute(
+                        """
+                        INSERT INTO memories (
+                            discord_user_id, memory_key, memory_value, category,
+                            confidence, strength, recall_count, source_message_id
+                        ) VALUES ($1, $2, $3, $4, $5, 1.0, 1, $6)
+                        """,
+                        str(user_id),
+                        memory["key"],
+                        memory["value"],
+                        memory["category"],
+                        memory["confidence"],
+                        source_message_id,
+                    )
+
+                saved_count += 1
+    return saved_count
+
+
+def valid_memory(memory):
+    if not isinstance(memory, dict):
+        return False
+    key = memory.get("key")
+    value = memory.get("value")
+    category = memory.get("category", "profile")
+    confidence = memory.get("confidence", 0.7)
+    if not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{1,60}", key):
+        return False
+    if not isinstance(value, str) or not value.strip() or len(value) > 500:
+        return False
+    if not isinstance(category, str) or not re.fullmatch(r"[a-z_]{1,30}", category):
+        return False
+    if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        return False
+    return True
+
+
+def parse_json_safely(text):
+    if not text:
+        return {}
+    cleaned = text.strip()
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(1)
+    else:
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            cleaned = cleaned[first_brace : last_brace + 1]
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {}
+
+
+# ==========================================
+# 4. المصفاة الذهنية في الخلفية (استخراج الحقائق والمواقف)
+# ==========================================
+async def update_memory_in_background(user_id, user_name, recent_history, source_message_id):
+    """مهمة خلفية: تستخرج الحقائق الراسخة وتلخص المواقف والأحداث المشتركة (Episodic)."""
+    if db_pool is None or not MEMORY_GEMINI_API_KEY:
+        return
+
+    async with memory_locks[str(user_id)]:
+        conversation = "\n".join(
+            f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
+            for message in recent_history
+        )
+
+        # 1. استخراج حقائق الذاكرة الدائمة
+        fact_prompt = f"""
+أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name}.
+لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
+
+أعد JSON صالحاً فقط:
+{{"memories":[{{"key":"english_snake_case","value":"حقيقة قصيرة بالعربية","category":"profile_or_preference_or_interest","confidence":0.85}}]}}
+
+المحادثة الأخيرة:
+{conversation}
+"""
+        fact_result = await request_gemini(
+            MEMORY_MODELS,
+            MEMORY_GEMINI_API_KEY,
+            {
+                "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 250,
+                    "temperature": 0.1,
+                    "responseMimeType": "application/json",
+                },
+            },
+            "Memory",
+        )
+        fact_data = parse_json_safely(fact_result)
+        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
+        saved_count = await save_memories(user_id, source_message_id, memories)
+        if saved_count:
+            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
+
+        # 2. تلخيص المواقف والسوالف (Episodic Memory) إذا كان الحوار يتضمن حدثاً أو سالفة
+        if len(recent_history) >= 4:
+            episode_prompt = f"""
+أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري.
+حلل الحوار التالي بين المستخدم ({user_name}) وإينا:
+هل تضمن الحوار حدثاً، موقفاً، قصة، أو تجربة مر بها المستخدم تستحق أن تُحفظ كذكرى وسالفة مشتركة بينكما؟
+(تجنب التحيات السريعة، أو الحوارات الفارغة التي لا تتضمن موضوعاً واضحاً).
+
+أعد JSON فقط:
+إذا كان هناك موقف:
+{{"has_episode": true, "summary": "ملخص دافئ ومختصر في جملة واحدة للموقف كذكرى مشتركة", "topics": ["كلمة1", "كلمة2"], "importance": 7}}
+إذا لم يكن هناك حدث يستحق الحفظ:
+{{"has_episode": false}}
+
+الحوار الأخير:
+{conversation}
+"""
+            ep_result = await request_gemini(
+                MEMORY_MODELS,
+                MEMORY_GEMINI_API_KEY,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 200,
+                        "temperature": 0.2,
+                        "responseMimeType": "application/json",
+                    },
+                },
+                "Memory",
+            )
+            ep_data = parse_json_safely(ep_result)
+            if ep_data.get("has_episode") and ep_data.get("summary"):
+                summary = ep_data["summary"].strip()
+                topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
+                importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+
+                async with db_pool.acquire() as connection:
+                    # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
+                    duplicate = await connection.fetchval(
+                        """
+                        SELECT 1 FROM episodes
+                        WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
+                        """,
+                        str(user_id),
+                        summary,
+                    )
+                    if not duplicate:
+                        await connection.execute(
+                            """
+                            INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
+                            VALUES ($1, $2, $3, $4, NOW())
+                            """,
+                            str(user_id),
+                            summary,
+                            topics,
+                            importance,
+                        )
+                        print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}")
+
+
+# ==========================================
+# 5. الاتصال المباشر بـ Gemini (المخ الرئيسي)
+# ==========================================
+async def request_gemini(models, api_key, payload, label):
     async with aiohttp.ClientSession() as session:
-        for model in MEMORY_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={MEMORY_GEMINI_API_KEY}"
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
             try:
-                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=20) as resp:
+                async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         candidates = data.get('candidates', [])
-                        if candidates:
-                            extracted_text = candidates[0].get('content', {}).get('parts', [])[0].get('text', '').strip()
-                            if extracted_text:
-                                await update_user_memory_db(user_id, user_name, extracted_text)
-                                print(f"🧠 [Memory Success] تم تحديث ذاكرة {user_name} بواسطة النموذج: {model}")
-                                break
+                        if not candidates:
+                            continue
+                        parts = candidates[0].get('content', {}).get('parts', [])
+                        result = "".join(p.get('text', '') for p in parts).strip()
+                        if result:
+                            return result
                     else:
                         err_body = await resp.text()
-                        print(f"⚠️ نموذج الذاكرة {model} رد بالحالة {resp.status}: {err_body}")
+                        print(f"⚠️ [{label}] النموذج {model} رد بالحالة {resp.status}: {err_body}")
             except Exception as e:
-                print(f"⚠️ خطأ أثناء تشغيل ذاكرة النموذج {model}: {e}")
+                print(f"⚠️ [{label}] خطأ أثناء الاتصال بالنموذج {model}: {e}")
                 continue
+    return None
 
-# ==========================================
-# 4. الاتصال المباشر بـ Gemini (المخ الرئيسي)
-# ==========================================
-async def ask_ena_brain(clean_prompt, user_name, core_facts, history_messages):
+
+async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_messages):
     try:
         if not clean_prompt:
             clean_prompt = "هلا"
@@ -206,8 +757,7 @@ async def ask_ena_brain(clean_prompt, user_name, core_facts, history_messages):
             "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
             "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
             "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n\n"
-            f"[ذاكرتك وانطباعك الشخصي الحالي عن {user_name}]:\n"
-            f"{core_facts if core_facts else 'لا توجد معلومات سابقة عنه.'}\n\n"
+            f"{cognitive_context if cognitive_context else f'[لا توجد معلومات سابقة عن {user_name}].'}\n\n"
             "قواعد الواقعية:\n"
             "1. استغل ذاكرتك بفهم شخصية المستخدم واهتماماته دون أن تقول له 'حسب ذاكرتي' أو 'أنا أتذكر'.\n"
             "2. ممنوع كلياً ذكر اسم مدينتك (الدمام) إلا إذا سُئلتِ مباشرة عنها.\n"
@@ -240,46 +790,24 @@ async def ask_ena_brain(clean_prompt, user_name, core_facts, history_messages):
                 "topP": 0.9
             }
         }
-        
-        reply_text = None
 
-        async with aiohttp.ClientSession() as session:
-            for model in MAIN_MODELS:
-                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={MAIN_GEMINI_API_KEY}"
-                try:
-                    async with session.post(gemini_url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            candidates = data.get('candidates', [])
-                            if not candidates:
-                                continue
-                                
-                            parts = candidates[0].get('content', {}).get('parts', [])
-                            reply = "".join(p.get('text', '') for p in parts)
-                            reply = clean_text(reply)
-                            
-                            if reply:
-                                reply_text = reply
-                                break
-                        else:
-                            err_body = await resp.text()
-                            print(f"⚠️ النموذج الرئيسي {model} رد بالحالة {resp.status}: {err_body}")
-                except Exception as e:
-                    print(f"⚠️ خطأ أثناء الاتصال بالنموذج الرئيسي {model}: {e}")
-                    continue
-
-        return reply_text or "هلا"
+        reply_text = await request_gemini(MAIN_MODELS, MAIN_GEMINI_API_KEY, payload, "Brain")
+        return clean_text(reply_text) or "هلا"
 
     except Exception as e:
         print(f"❌ خطأ غير متوقع في ask_ena_brain: {e}")
         return "هلا"
 
+
 # ==========================================
-# 5. أحداث ديسكورد
+# 6. أحداث ديسكورد
 # ==========================================
 @client.event
 async def on_ready():
+    db_status = "متصلة ✅" if db_pool is not None else "غير متصلة ❌"
     print(f"✅ تم الاتصال بنجاح: {client.user}")
+    print(f"📊 حالة قاعدة البيانات: {db_status}")
+
 
 @client.event
 async def on_message(message):
@@ -294,37 +822,32 @@ async def on_message(message):
 
         print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
 
-        # 1. حفظ رسالة المستخدم في DB
-        await save_message_db(message.channel.id, user_id, user_name, "user", clean_prompt)
+        # 1. حفظ رسالة المستخدم وجلب سجل المحادثة القريب
+        await upsert_user(user_id, user_name)
+        user_message_id = await save_message(message.channel.id, user_id, "user", clean_prompt)
+        recent_history = await get_recent_history(message.channel.id, user_id)
 
-        # 2. جلب بروفايل المستخدم وسجل المحادثة القريب
-        profile = await get_user_profile_db(user_id, user_name)
-        core_facts = profile.get("core_facts", "")
-        msg_count = profile.get("msg_count", 0) + 1
-        
-        recent_history = await get_recent_history_db(message.channel.id, limit=8)
+        # 2. استرجاع الذكريات والمواقف بالترابط الدلالي البشري
+        cognitive_data = await get_associative_context(user_id, clean_prompt)
+        cognitive_context = format_cognitive_context(user_name, cognitive_data)
 
         # 3. توليد الرد المباشر
         async with message.channel.typing():
-            reply = await ask_ena_brain(clean_prompt, user_name, core_facts, recent_history)
+            reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, recent_history)
             await message.reply(reply, mention_author=False)
 
-        # 4. حفظ رد البوت في DB
-        await save_message_db(message.channel.id, user_id, user_name, "إينا", reply)
+        # 4. حفظ رد البوت في القاعدة
+        await save_message(message.channel.id, user_id, "model", reply)
 
-        # 5. تحديث العداد وفحص تشغيل المصفاة الذهنية في الخلفية كل 8 رسائل
-        if msg_count % 8 == 0:
-            recent_text_block = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in recent_history])
-            
-            # إطلاق المهمة في الخلفية دون تعطيل استجابة ديسكورد (Non-blocking)
+        # 5. تثبيت الحقائق والمواقف في الخلفية
+        if user_message_id is not None:
             asyncio.create_task(
-                run_memory_filter_background(user_id, user_name, recent_text_block, core_facts)
+                update_memory_in_background(user_id, user_name, recent_history, user_message_id)
             )
 
-        # تحديث العداد في DB
-        await update_user_memory_db(user_id, user_name, core_facts, new_count=msg_count)
 
 async def main():
+    await initialize_database()
     await start_web_server()
     await client.start(DISCORD_TOKEN)
 
