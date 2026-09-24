@@ -44,14 +44,21 @@ MAIN_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
-    "gemini-3.7-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-3.7-flash"
 ]
 
 # ==========================================
 # النماذج المعتمدة منفصلة للمصفاة الذهنية (الذاكرة)
 # ==========================================
 MEMORY_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite"
+]
+
+# نماذج ملخص المواقف: الأقوى أولاً — يعمل بمفتاح الذاكرة المستقل (مشروع منفصل بحصصه الخاصة)
+# فحصته 20/يوم لا تلمس حصص مفتاح الردود، وعند نفادها يسقط تلقائياً على lite
+EPISODE_MODELS = [
+    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite"
 ]
@@ -661,16 +668,19 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
         # 2. تلخيص المواقف والسوالف (Episodic Memory) بالتوازي مع الحقائق لتقليل زمن المعالجة
         if len(recent_history) >= 4:
             episode_prompt = f"""
-أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري.
-حلل الحوار التالي بين المستخدم ({user_name}) وإينا:
-هل تضمن الحوار حدثاً، موقفاً، قصة، أو تجربة مر بها المستخدم تستحق أن تُحفظ كذكرى وسالفة مشتركة بينكما؟
-(تجنب التحيات السريعة، أو الحوارات الفارغة التي لا تتضمن موضوعاً واضحاً).
+أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري. حلل الحوار التالي بين المستخدم ({user_name}) وإينا.
+
+خطوات تفكيرك قبل الإجابة (اكتبها في حقل thinking):
+1. اقرأ الحوار وحدد بالضبط: من الذي تحدث؟ وما الذي حدث فعلاً — بكلماتك أنت أنت.
+2. تجاهل التحيات والكلمات المشوشة والعابرة، وابحث عن المعنى العام للحديث.
+3. قرر: هل يوجد حدث أو موقف حقيقي يستحق الحفظ كذكرى؟ (لا يوجد: has_episode = false وانتهى).
+4. اكتب الملخص بصيغة عربية واضحة كاملة "من فعل ماذا" — جملة واحدة تفهم وحدها، وممنوع نقل كلمات غامضة من الحوار حرفياً، أعد صياغتها بوضوح.
 
 أعد JSON فقط:
 إذا كان هناك موقف:
-{{"has_episode": true, "summary": "ملخص دافئ ومختصر في جملة واحدة للموقف كذكرى مشتركة", "topics": ["كلمة1", "كلمة2"], "importance": 7}}
+{{"thinking": "تحليلك السريع: من فعل ماذا، وما الحدث الحقيقي هنا", "has_episode": true, "summary": "ملخص دافئ ومختصر في جملة واحدة واضحة للموقف كذكرى مشتركة", "topics": ["كلمة1", "كلمة2"], "importance": 7}}
 إذا لم يكن هناك حدث يستحق الحفظ:
-{{"has_episode": false}}
+{{"thinking": "سبب الاستبعاد باختصار", "has_episode": false}}
 
 الحوار الأخير:
 {conversation}
@@ -678,17 +688,17 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
             fact_result, ep_result = await asyncio.gather(
                 fact_task,
                 request_gemini(
-                    MEMORY_MODELS,
+                    EPISODE_MODELS,
                     MEMORY_GEMINI_API_KEY,
                     {
                         "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
                         "generationConfig": {
-                            "maxOutputTokens": 200,
+                            "maxOutputTokens": 450,
                             "temperature": 0.2,
                             "responseMimeType": "application/json",
                         },
                     },
-                    "Memory",
+                    "Episode",
                 ),
             )
         else:
