@@ -974,11 +974,16 @@ async def request_gemini(models, api_key, payload, label):
                     data = await resp.json()
                     candidates = data.get('candidates', [])
                     if not candidates:
+                        block_reason = (data.get('promptFeedback') or {}).get('blockReason', 'غير معروف')
+                        print(f"⚠️ [{label}] النموذج {model}: رجع بلا نتائج (blockReason: {block_reason})")
                         continue
                     parts = candidates[0].get('content', {}).get('parts', [])
                     result = "".join(p.get('text', '') for p in parts).strip()
                     if result:
+                        print(f"✅ [{label}] الرد من: {model}")
                         return result
+                    finish_reason = candidates[0].get('finishReason', 'غير معروف')
+                    print(f"⚠️ [{label}] النموذج {model}: نتيجة فارغة (finishReason: {finish_reason})")
                 else:
                     err_body = await resp.text()
                     print(f"⚠️ [{label}] النموذج {model} رد بالحالة {resp.status}: {err_body}")
