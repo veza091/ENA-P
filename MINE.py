@@ -63,6 +63,18 @@ EPISODE_MODELS = [
     "gemini-3.5-flash-lite"
 ]
 
+# ==========================================
+# ثوابت نظام المشاعر (مزاج إينا المتدرج)
+# ==========================================
+EMOTION_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite"
+]
+MOOD_BASELINE_V = 0.0      # طابع الأساس: محايد
+MOOD_BASELINE_A = 0.2      # طاقة الأساس: هادئ
+MOOD_EMA_ALPHA = 0.25      # وزن إشارة الرسالة الجديدة في المتوسط المتحرك
+MOOD_DECAY_PER_HOUR = 0.5  # نصف قوة المزاج تتبخر كل ساعة سكون
+
 HISTORY_LIMIT = 10
 
 def clean_text(text):
@@ -171,6 +183,124 @@ def human_time_ago(occurred_at):
 
 
 # ==========================================
+# نظام المشاعر: مزاج إينا المتدرج (النموذج الدائري: طابع × طاقة)
+# ==========================================
+def mood_zone(valence, arousal):
+    """يسمي منطقة المزاج الست من نقطة الطابع/الطاقة."""
+    if valence >= 0.3:
+        return "مبسوط ومتكهرب" if arousal >= 0.5 else "مرتاح ودافئ"
+    if valence <= -0.3:
+        return "متضايق ومنفعل" if arousal >= 0.5 else "مطفوط"
+    return "متكهرب مشدود" if arousal >= 0.5 else "هادي طبيعي"
+
+
+def apply_mood_decay(valence, arousal, last_updated):
+    """يقرب المزاج نحو أساسه كلما طال السكون — نصف قوته تتبخر كل ساعة."""
+    now = datetime.now(timezone.utc)
+    if last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    hours = max(0.0, (now - last_updated).total_seconds() / 3600.0)
+    factor = MOOD_DECAY_PER_HOUR ** hours
+    return (
+        MOOD_BASELINE_V + (valence - MOOD_BASELINE_V) * factor,
+        MOOD_BASELINE_A + (arousal - MOOD_BASELINE_A) * factor,
+    )
+
+
+def update_mood(old_v, old_a, signal_v, signal_a):
+    """متوسط متحرك: المزاج ينزاح قليلاً بكل رسالة ولا يقفز أبداً، مع قفل الحدود رياضياً."""
+    new_v = (1.0 - MOOD_EMA_ALPHA) * old_v + MOOD_EMA_ALPHA * signal_v
+    new_a = (1.0 - MOOD_EMA_ALPHA) * old_a + MOOD_EMA_ALPHA * signal_a
+    return (
+        max(-1.0, min(1.0, new_v)),
+        max(0.0, min(1.0, new_a)),
+    )
+
+
+def valid_emotion(data):
+    """يتحقق من سلامة حقول كشف المشاعر ويعيدها منظفة، أو None إن كانت فاسدة."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        valence = float(data.get("valence"))
+        arousal = float(data.get("arousal"))
+        intensity = float(data.get("intensity", 1.0))
+    except (TypeError, ValueError):
+        return None
+    if not (-1.0 <= valence <= 1.0 and 0.0 <= arousal <= 1.0 and 0.0 <= intensity <= 1.0):
+        return None
+    return {
+        "emotion": str(data.get("emotion", "محايد"))[:50],
+        "valence": valence,
+        "arousal": arousal,
+        "intensity": intensity,
+        "note": str(data.get("note", ""))[:200],
+    }
+
+
+async def get_user_mood(user_id):
+    """يجلب مزاج إينا الحالي تجاه المستخدم مع تحلل السكون — فشله لا يكسر الرد أبداً."""
+    try:
+        if db_pool is None:
+            raise RuntimeError("قاعدة البيانات غير متاحة")
+        row = await db_pool.fetchrow(
+            "SELECT mood_valence, mood_arousal, mood_updated_at FROM users WHERE discord_user_id = $1",
+            str(user_id),
+        )
+        if not row:
+            return MOOD_BASELINE_V, MOOD_BASELINE_A, mood_zone(MOOD_BASELINE_V, MOOD_BASELINE_A)
+        valence, arousal = apply_mood_decay(row["mood_valence"], row["mood_arousal"], row["mood_updated_at"])
+        return valence, arousal, mood_zone(valence, arousal)
+    except Exception as error:
+        print(f"⚠️ [Mood] تعذر جلب المزاج: {error}")
+        return MOOD_BASELINE_V, MOOD_BASELINE_A, mood_zone(MOOD_BASELINE_V, MOOD_BASELINE_A)
+
+
+async def update_user_mood(user_id, signal_v, signal_a, note):
+    """يحدّث مزاج إينا تجاه المستخدم بالمتوسط المتحرك ويسجل التحولات بين المناطق."""
+    if db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT mood_valence, mood_arousal, mood_updated_at FROM users WHERE discord_user_id = $1",
+                str(user_id),
+            )
+            if not row:
+                return
+            old_v, old_a = apply_mood_decay(row["mood_valence"], row["mood_arousal"], row["mood_updated_at"])
+            new_v, new_a = update_mood(old_v, old_a, signal_v, signal_a)
+            old_zone = mood_zone(old_v, old_a)
+            new_zone = mood_zone(new_v, new_a)
+
+            await connection.execute(
+                """
+                UPDATE users
+                SET mood_valence = $2, mood_arousal = $3, mood_updated_at = NOW()
+                WHERE discord_user_id = $1
+                """,
+                str(user_id),
+                new_v,
+                new_a,
+            )
+            if old_zone != new_zone:
+                await connection.execute(
+                    """
+                    INSERT INTO mood_log (discord_user_id, valence, arousal, zone, trigger)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    str(user_id),
+                    new_v,
+                    new_a,
+                    new_zone,
+                    note,
+                )
+                print(f"💙 [Mood] مزاج إينا تحول إلى: {new_zone} ({new_v:+.2f}, {new_a:.2f})")
+    except Exception as error:
+        print(f"⚠️ [Mood] فشل تحديث المزاج: {error}")
+
+
+# ==========================================
 # 1. خادم الويب (لإبقاء Render نشطاً)
 # ==========================================
 async def handle_ping(request):
@@ -257,19 +387,39 @@ CREATE INDEX IF NOT EXISTS episodes_user_occurred_idx
 CREATE INDEX IF NOT EXISTS episodes_user_importance_idx
     ON episodes (discord_user_id, importance DESC);
 
+-- ترقية جدول المستخدمين بأعمدة مزاج إينا (النموذج الدائري: طابع × طاقة)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mood_valence DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mood_arousal DOUBLE PRECISION NOT NULL DEFAULT 0.2;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mood_updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+-- سجل تحولات المزاج (يُكتب فقط عند انتقال المزاج بين المناطق)
+CREATE TABLE IF NOT EXISTS mood_log (
+    id BIGSERIAL PRIMARY KEY,
+    discord_user_id TEXT NOT NULL REFERENCES users(discord_user_id)
+        ON DELETE CASCADE,
+    valence DOUBLE PRECISION NOT NULL,
+    arousal DOUBLE PRECISION NOT NULL,
+    zone TEXT NOT NULL,
+    trigger TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS mood_log_user_created_idx
+    ON mood_log (discord_user_id, created_at DESC);
+
 -- حماية RLS لجميع الجداول
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE episodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mood_log ENABLE ROW LEVEL SECURITY;
 
 DO $$
 BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
-        REVOKE ALL ON TABLE users, messages, memories, episodes FROM anon;
+        REVOKE ALL ON TABLE users, messages, memories, episodes, mood_log FROM anon;
     END IF;
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
-        REVOKE ALL ON TABLE users, messages, memories, episodes FROM authenticated;
+        REVOKE ALL ON TABLE users, messages, memories, episodes, mood_log FROM authenticated;
     END IF;
 END $$;
 """
@@ -635,13 +785,14 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
         return
 
     async with memory_locks[str(user_id)]:
-        conversation = "\n".join(
-            f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
-            for message in recent_history
-        )
+        try:
+            conversation = "\n".join(
+                f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
+                for message in recent_history
+            )
 
-        # 1. استخراج حقائق الذاكرة الدائمة
-        fact_prompt = f"""
+            # 1. استخراج حقائق الذاكرة الدائمة
+            fact_prompt = f"""
 أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name}.
 لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
 
@@ -651,23 +802,60 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 المحادثة الأخيرة:
 {conversation}
 """
-        fact_task = request_gemini(
-            MEMORY_MODELS,
-            MEMORY_GEMINI_API_KEY,
-            {
-                "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": 250,
-                    "temperature": 0.1,
-                    "responseMimeType": "application/json",
+            fact_task = request_gemini(
+                MEMORY_MODELS,
+                MEMORY_GEMINI_API_KEY,
+                {
+                    "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 250,
+                        "temperature": 0.1,
+                        "responseMimeType": "application/json",
+                    },
                 },
-            },
-            "Memory",
-        )
+                "Memory",
+            )
 
-        # 2. تلخيص المواقف والسوالف (Episodic Memory) بالتوازي مع الحقائق لتقليل زمن المعالجة
-        if len(recent_history) >= 4:
-            episode_prompt = f"""
+            # كشف مشاعر المستخدم — نداء متوازٍ يدفع مزاج إينا
+            last_user_message = next(
+                (m["content"] for m in reversed(recent_history) if m["role"] == "user"),
+                None,
+            )
+            emotion_task = None
+            if last_user_message:
+                emotion_prompt = f"""
+أنت محلل مشاعر في بوت Discord. حلل شعور المستخدم ({user_name}) في آخر رسالة له، مع اعتبار سياق المحادثة.
+
+أعد JSON صالحاً فقط:
+{{"emotion": "أحد: سعيد/متحمس، حزين، غاضب، خائف/متوتر، مندهش، مشمئز، محبّط، محايد", "intensity": 0.7, "valence": 0.5, "arousal": 0.8, "note": "سبب مختصر بالعربية"}}
+
+valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal من 0 (هادئ) إلى 1 (منفعل جداً)، وintensity من 0 إلى 1.
+استنتج الشعور من نبرة الكلام العامية لا من المعنى الحرفي فقط.
+
+آخر رسالة من المستخدم:
+{last_user_message}
+
+سياق المحادثة:
+{conversation}
+"""
+                emotion_task = request_gemini(
+                    EMOTION_MODELS,
+                    MEMORY_GEMINI_API_KEY,
+                    {
+                        "contents": [{"role": "user", "parts": [{"text": emotion_prompt}]}],
+                        "generationConfig": {
+                            "maxOutputTokens": 120,
+                            "temperature": 0.1,
+                            "responseMimeType": "application/json",
+                        },
+                    },
+                    "Emotion",
+                )
+
+            # 2. تلخيص المواقف والسوالف (Episodic Memory) — مهمة متوازية عند الحوار الطويل
+            episode_task = None
+            if len(recent_history) >= 4:
+                episode_prompt = f"""
 أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري. حلل الحوار التالي بين المستخدم ({user_name}) وإينا.
 
 خطوات تفكيرك قبل الإجابة (اكتبها في حقل thinking):
@@ -685,9 +873,7 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
 الحوار الأخير:
 {conversation}
 """
-            fact_result, ep_result = await asyncio.gather(
-                fact_task,
-                request_gemini(
+                episode_task = request_gemini(
                     EPISODE_MODELS,
                     MEMORY_GEMINI_API_KEY,
                     {
@@ -699,48 +885,71 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
                         },
                     },
                     "Episode",
-                ),
-            )
-        else:
-            fact_result = await fact_task
+                )
+
+            # تشغيل المهام المتوازية معاً (صفر تأخير إضافي على الرد)
+            parallel_tasks = [task for task in (fact_task, episode_task, emotion_task) if task is not None]
+            results = await asyncio.gather(*parallel_tasks)
+
+            fact_result = results[0]
             ep_result = None
+            emo_result = None
+            idx = 1
+            if episode_task is not None:
+                ep_result = results[idx]
+                idx += 1
+            if emotion_task is not None:
+                emo_result = results[idx]
 
-        fact_data = parse_json_safely(fact_result)
-        memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
-        saved_count = await save_memories(user_id, source_message_id, memories)
-        if saved_count:
-            print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
-
-        # معالجة نتيجة الموقف (إن كان قد طُلب)
-        if ep_result is not None:
-            ep_data = parse_json_safely(ep_result)
-            if ep_data.get("has_episode") and ep_data.get("summary"):
-                summary = ep_data["summary"].strip()
-                topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
-                importance = max(1, min(int(ep_data.get("importance", 5)), 10))
-
-                async with db_pool.acquire() as connection:
-                    # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
-                    duplicate = await connection.fetchval(
-                        """
-                        SELECT 1 FROM episodes
-                        WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
-                        """,
-                        str(user_id),
-                        summary,
+            # 3. دفع المشاعر إلى مزاج إينا (فشلها آمن ولا يمس الذاكرة)
+            if emo_result:
+                emotion_data = valid_emotion(parse_json_safely(emo_result))
+                if emotion_data:
+                    await update_user_mood(
+                        user_id,
+                        emotion_data["valence"],
+                        emotion_data["arousal"],
+                        f"{emotion_data['emotion']} (شدة {emotion_data['intensity']:.1f}): {emotion_data['note']}",
                     )
-                    if not duplicate:
-                        await connection.execute(
+
+            fact_data = parse_json_safely(fact_result)
+            memories = [m for m in fact_data.get("memories", []) if valid_memory(m)]
+            saved_count = await save_memories(user_id, source_message_id, memories)
+            if saved_count:
+                print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
+
+            # معالجة نتيجة الموقف (إن كان قد طُلب)
+            if ep_result is not None:
+                ep_data = parse_json_safely(ep_result)
+                if ep_data.get("has_episode") and ep_data.get("summary"):
+                    summary = ep_data["summary"].strip()
+                    topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
+                    importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+
+                    async with db_pool.acquire() as connection:
+                        # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
+                        duplicate = await connection.fetchval(
                             """
-                            INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
-                            VALUES ($1, $2, $3, $4, NOW())
+                            SELECT 1 FROM episodes
+                            WHERE discord_user_id = $1 AND summary = $2 AND occurred_at > NOW() - INTERVAL '1 hour'
                             """,
                             str(user_id),
                             summary,
-                            topics,
-                            importance,
                         )
-                        print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}")
+                        if not duplicate:
+                            await connection.execute(
+                                """
+                                INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
+                                VALUES ($1, $2, $3, $4, NOW())
+                                """,
+                                str(user_id),
+                                summary,
+                                topics,
+                                importance,
+                            )
+                            print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}")
+        except Exception as error:
+            print(f"⚠️ [Memory] فشل تحديث ذاكرة المستخدم {user_name}: {error}")
 
 
 # ==========================================
@@ -779,22 +988,24 @@ async def request_gemini(models, api_key, payload, label):
     return None
 
 
-async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_messages):
+async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_messages, mood_zone_name="هادي طبيعي"):
     try:
         if not clean_prompt:
             clean_prompt = "هلا"
 
-        # دمج الذاكرة في الـ System Instruction
+        # دمج الذاكرة والمزاج في الـ System Instruction
         system_instruction = (
             "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
             "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
             "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n\n"
             f"{cognitive_context if cognitive_context else f'[لا توجد معلومات سابقة عن {user_name}].'}\n\n"
+            f"[مزاجك الآن تجاه {user_name}]: {mood_zone_name} — يلوّن أسلوبك ولا يكسر قواعدك.\n\n"
             "قواعد الواقعية:\n"
             "1. استغل ذاكرتك بفهم شخصية المستخدم واهتماماته دون أن تقول له 'حسب ذاكرتي' أو 'أنا أتذكر'.\n"
             "2. ممنوع كلياً ذكر اسم مدينتك (الدمام) إلا إذا سُئلتِ مباشرة عنها.\n"
             "3. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة وبدون تصنع.\n"
-            "4. لا تختلقي قصصاً وهمية وممنوع كلياً الاعتراف بأنك ذكاء اصطناعي أو بوت."
+            "4. لا تختلقي قصصاً وهمية وممنوع كلياً الاعتراف بأنك ذكاء اصطناعي أو بوت.\n"
+            "5. لاحظ شعور المستخدم من رسالته الأخيرة وردّ بما يناسبه: تعاطف إن كان حزيناً، وحماس إن كان متحمساً، وهدوء بارد إن كان مزعجاً — بدون إهانة أبداً."
         )
 
         # بناء سياق الحوار المباشر من الذاكرة القريبة
@@ -848,41 +1059,66 @@ async def on_message(message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     if client.user in message.mentions or is_dm:
-        user_id = str(message.author.id)
-        user_name = message.author.display_name
-        clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "هلا"
+        # الشبكة الأمنية النهائية: أي خطأ غير متوقع يُسجل ويُخبر المستخدم بهدوء
+        try:
+            await process_message(message)
+        except Exception as error:
+            print(f"❌ [Message Error] {error}")
+            try:
+                await message.reply("صار عندي تعليق بسيط، جرب مرة ثانية.", mention_author=False)
+            except Exception as reply_error:
+                print(f"❌ [Message Error] تعذر إرسال رسالة الخطأ: {reply_error}")
 
-        print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
 
-        # 1. كتابة بيانات المستخدم فقط عند أول ظهور أو تغيّر الاسم (قبل الرسالة بسبب المفتاح الأجنبي)
+async def process_message(message):
+    user_id = str(message.author.id)
+    user_name = message.author.display_name
+    clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "هلا"
+
+    print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
+
+    # 1. طبقة الذاكرة: فشلها لا يمنع الرد — نكمل بدون ذاكرة وبمزاج محايد بدل الصمت الكامل
+    user_message_id = None
+    cognitive_context = ""
+    recent_history = []
+    mood_zone_name = "هادي طبيعي"
+    try:
+        # كتابة بيانات المستخدم فقط عند أول ظهور أو تغيّر الاسم (قبل الرسالة بسبب المفتاح الأجنبي)
         if user_name_cache.get(user_id) != user_name:
             await upsert_user(user_id, user_name)
             user_name_cache[user_id] = user_name
 
-        # حفظ الرسالة واسترجاع الذكريات بالتوازي (لا يعتمد أحدهما على الآخر)
-        user_message_id, cognitive_data = await asyncio.gather(
+        # حفظ الرسالة واسترجاع الذكريات وجلب المزاج بالتوازي (لا يعتمد أحدهما على الآخر)
+        user_message_id, cognitive_data, (mood_v, mood_a, mood_zone_name) = await asyncio.gather(
             save_message(message.channel.id, user_id, "user", clean_prompt),
             get_associative_context(user_id, clean_prompt),
+            get_user_mood(user_id),
         )
         recent_history = await get_recent_history(message.channel.id, user_id)
-
-        # 2. استرجاع الذكريات والمواقف بالترابط الدلالي البشري
-        cognitive_data = await get_associative_context(user_id, clean_prompt)
         cognitive_context = format_cognitive_context(user_name, cognitive_data)
+    except Exception as error:
+        print(f"⚠️ [Memory] تعطلت طبقة الذاكرة مؤقتاً — سيتم الرد بدون ذاكرة: {error}")
+        user_message_id = None
+        cognitive_context = ""
+        recent_history = []
+        mood_zone_name = "هادي طبيعي"
 
-        # 3. توليد الرد المباشر
-        async with message.channel.typing():
-            reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, recent_history)
-            await message.reply(reply, mention_author=False)
+    # 2. توليد الرد المباشر — لا يعتمد على الذاكرة إطلاقاً
+    async with message.channel.typing():
+        reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, recent_history, mood_zone_name)
+        await message.reply(reply, mention_author=False)
 
-        # 4. حفظ رد البوت في القاعدة
+    # 3. حفظ رد البوت في القاعدة — فشله يُسجل فقط
+    try:
         await save_message(message.channel.id, user_id, "model", reply)
+    except Exception as error:
+        print(f"⚠️ [Memory] تعذر حفظ رد البوت: {error}")
 
-        # 5. تثبيت الحقائق والمواقف في الخلفية
-        if user_message_id is not None:
-            asyncio.create_task(
-                update_memory_in_background(user_id, user_name, recent_history, user_message_id)
-            )
+    # 4. تثبيت الحقائق والمواقف في الخلفية (محمية داخلياً)
+    if user_message_id is not None:
+        asyncio.create_task(
+            update_memory_in_background(user_id, user_name, recent_history, user_message_id)
+        )
 
 
 async def main():
