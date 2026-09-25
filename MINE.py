@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import random
@@ -80,7 +81,11 @@ MOOD_BASELINE_A = 0.2      # طاقة الأساس: هادئ
 MOOD_EMA_ALPHA = 0.25      # وزن إشارة الرسالة الجديدة في المتوسط المتحرك
 MOOD_DECAY_PER_HOUR = 0.5  # نصف قوة المزاج تتبخر كل ساعة سكون
 
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 12
+
+# قنوات المراقبة (وعي المجموعة): معرفات قنوات مفصولة بفواصل من متغير البيئة WATCH_CHANNELS
+# الرسائل تُؤرشف في القاعدة فقط — صفر نداءات Gemini — وفارغ يعني الميزة معطلة كلياً
+WATCH_CHANNELS = {c.strip() for c in os.getenv("WATCH_CHANNELS", "").split(",") if c.strip()}
 
 def clean_text(text):
     if not text:
@@ -185,6 +190,52 @@ def human_time_ago(occurred_at):
         return "قبل أسبوعين أو ثلاثة"
     else:
         return "من فترة"
+
+
+# ==========================================
+# الوعي الزمني: الوقت الحالي ومدة الغياب
+# ==========================================
+SAUDI_TZ = timezone(timedelta(hours=3))  # توقيت السعودية (بلا توقيت صيفي)
+ARABIC_WEEKDAYS = ("الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد")
+
+
+def arabic_time_context():
+    """الوقت الحالي بتوقيت السعودية بصياغة بشرية قصيرة."""
+    now = datetime.now(SAUDI_TZ)
+    weekday = ARABIC_WEEKDAYS[now.weekday()]
+    hour = now.hour
+    if 5 <= hour < 12:
+        period = "صباحاً"
+    elif 12 <= hour < 15:
+        period = "ظهراً"
+    elif 15 <= hour < 18:
+        period = "عصراً"
+    elif 18 <= hour < 21:
+        period = "مساءً"
+    else:
+        period = "بجوف الليل"
+    clock = now.strftime("%I:%M").lstrip("0")
+    return f"الساعة {clock} {period} من يوم {weekday}"
+
+
+def human_gap_ago(delta):
+    """يصيغ مدة الغياب بعبارة قصيرة (قبل دقائق/ساعات/أيام)."""
+    minutes = max(1, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"قبل {minutes} دقيقة" if minutes == 1 else f"قبل {minutes} دقائق"
+    hours = minutes // 60
+    if hours == 1:
+        return "قبل ساعة"
+    if hours == 2:
+        return "قبل ساعتين"
+    if hours < 24:
+        return f"قبل {hours} ساعات"
+    days = hours // 24
+    if days == 1:
+        return "قبل يوم"
+    if days == 2:
+        return "قبل يومين"
+    return f"قبل {days} أيام"
 
 
 # ==========================================
@@ -514,20 +565,23 @@ async def save_message(channel_id, user_id, role, content):
         )
 
 
-async def get_recent_history(channel_id, user_id, limit=HISTORY_LIMIT):
+async def get_recent_history(channel_id, limit=HISTORY_LIMIT, exclude_id=None):
+    """آخر رسائل القناة من كل المتحدثين (وعي المجموعة) مع أسمائهم، بترتيب زمني."""
     if db_pool is None:
         return []
     async with db_pool.acquire() as connection:
         rows = await connection.fetch(
             """
-            SELECT role, content
-            FROM messages
-            WHERE channel_id = $1 AND discord_user_id = $2
-            ORDER BY created_at DESC, id DESC
+            SELECT m.role, m.content, m.discord_user_id,
+                   COALESCE(u.display_name, 'مستخدم') AS speaker
+            FROM messages m
+            LEFT JOIN users u ON u.discord_user_id = m.discord_user_id
+            WHERE m.channel_id = $1 AND ($2::BIGINT IS NULL OR m.id <> $2)
+            ORDER BY m.created_at DESC, m.id DESC
             LIMIT $3
             """,
             str(channel_id),
-            str(user_id),
+            exclude_id,
             limit,
         )
     return list(reversed(rows))
@@ -792,13 +846,14 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
     async with memory_locks[str(user_id)]:
         try:
             conversation = "\n".join(
-                f"{'المستخدم' if message['role'] == 'user' else 'إينا'}: {message['content']}"
-                for message in recent_history
+                f"إينا: {m['content']}" if m["role"] == "model" else f"{m['speaker']}: {m['content']}"
+                for m in recent_history
             )
 
-            # 1. استخراج حقائق الذاكرة الدائمة
+            # 1. استخراج حقائق الذاكرة الدائمة — للمخاطب فقط، وكلام الآخرين سياق لا ملف
             fact_prompt = f"""
-أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name}.
+أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name} (صاحب آخر رسالة موجهة للبوت).
+قد يشارك في حوار القناة أشخاص آخرون — كلامهم سياق فقط: لا تخزن حقائق عنهم مهما كانت.
 لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
 
 أعد JSON صالحاً فقط:
@@ -821,9 +876,12 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
                 "Memory",
             )
 
-            # كشف مشاعر المستخدم — نداء متوازٍ يدفع مزاج إينا
+            # كشف مشاعر المستخدم — نداء متوازٍ يدفع مزاج إينا (رسائل المخاطب فقط)
             last_user_message = next(
-                (m["content"] for m in reversed(recent_history) if m["role"] == "user"),
+                (
+                    m["content"] for m in reversed(recent_history)
+                    if m["role"] == "user" and m["discord_user_id"] == str(user_id)
+                ),
                 None,
             )
             emotion_task = None
@@ -857,16 +915,16 @@ valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal
                     "Emotion",
                 )
 
-            # 2. تلخيص المواقف والسوالف (Episodic Memory) — مهمة متوازية عند الحوار الطويل
+            # 2. تلخيص المواقف والسوالف (Episodic Memory) — واعٍ بالقناة ومشاركيها
             episode_task = None
             if len(recent_history) >= 4:
                 episode_prompt = f"""
-أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري. حلل الحوار التالي بين المستخدم ({user_name}) وإينا.
+أنت مسؤول الذاكرة العرضية (Episodic Memory) كصديق بشري. حلل الحوار التالي من قناة ديسكورد يشارك فيه {user_name} وإينا وقد يشارك فيه أصدقاء آخرون.
 
 خطوات تفكيرك قبل الإجابة (اكتبها في حقل thinking):
 1. اقرأ الحوار وحدد بالضبط: من الذي تحدث؟ وما الذي حدث فعلاً — بكلماتك أنت أنت.
 2. تجاهل التحيات والكلمات المشوشة والعابرة، وابحث عن المعنى العام للحديث.
-3. قرر: هل يوجد حدث أو موقف حقيقي يستحق الحفظ كذكرى؟ (لا يوجد: has_episode = false وانتهى).
+3. قرر: هل يوجد حدث أو موقف حقيقي عاشه أعضاء الحوار يستحق الحفظ كذكرى مشتركة؟ (لا يوجد: has_episode = false وانتهى).
 4. اكتب الملخص بصيغة عربية واضحة كاملة "من فعل ماذا" — جملة واحدة تفهم وحدها، وممنوع نقل كلمات غامضة من الحوار حرفياً، أعد صياغتها بوضوح.
 
 أعد JSON فقط:
@@ -998,15 +1056,16 @@ async def request_gemini(models, api_key, payload, label):
     return None
 
 
-async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_messages, mood_zone_name="هادي طبيعي"):
+async def ask_ena_brain(clean_prompt, user_name, cognitive_context, transcript, mood_zone_name="هادي طبيعي", time_context="", image_parts=None):
     try:
         if not clean_prompt:
             clean_prompt = "هلا"
 
-        # دمج الذاكرة والمزاج في الـ System Instruction
+        # دمج الذاكرة والمزاج والوقت في الـ System Instruction
         system_instruction = (
             "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
             "لهجتك خليجية (أهل الدمام)، وردّي دائماً بنفس لهجة المستخدم وأسلوب حديثه. "
+            "إذا وصلتك صورة أو ميمز، علّقي عليها بأسلوبك العفوي كأنك شافتها عينك. "
             "بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
             "رديّ عفوي من كلمة إلى جملتين حسب ما يتطلبه الحديث — القصير الطبيعي أجمل من الطويل المفتعل، "
             "وكل كلمة تكتبينها لازم تكون كلمة يقولها إنسان فعلاً.\n\n"
@@ -1018,30 +1077,29 @@ async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_mess
             "المستخدم: اخلصت المشروع الحين\n"
             "أنتِ: اخيراً! عاد ما تبي تراجعه مرة ثانية صح؟\n\n"
             f"{cognitive_context if cognitive_context else f'[لا توجد معلومات سابقة عن {user_name}].'}\n\n"
-            f"[مزاجك الآن تجاه {user_name}]: {mood_zone_name} — يلوّن أسلوبك ولا يكسر قواعدك.\n\n"
+        )
+        mood_block = f"[مزاجك الآن تجاه {user_name}]: {mood_zone_name} — يلوّن أسلوبك ولا يكسر قواعدك."
+        if time_context:
+            mood_block = f"[الوقت الآن]: {time_context}\n{mood_block}"
+        system_instruction += (
+            mood_block + "\n\n"
             "قواعد الواقعية:\n"
             "1. استغل ذاكرتك بفهم شخصية المستخدم واهتماماته دون أن تقول له 'حسب ذاكرتي' أو 'أنا أتذكر'.\n"
             "2. ممنوع كلياً ذكر اسم مدينتك (الدمام) إلا إذا سُئلتِ مباشرة عنها.\n"
             "3. ردي بأسلوب واقعي يطابق بنت عمرها 18 سنة وبدون تصنع.\n"
             "4. لا تختلقي قصصاً وهمية وممنوع كلياً الاعتراف بأنك ذكاء اصطناعي أو بوت.\n"
-            "5. لاحظ شعور المستخدم من رسالته الأخيرة وردّ بما يناسبه: تعاطف إن كان حزيناً، وحماس إن كان متحمساً، وهدوء بارد إن كان مزعجاً — بدون إهانة أبداً."
+            "5. لاحظ شعور المستخدم من رسالته الأخيرة وردّ بما يناسبه: تعاطف إن كان حزيناً، وحماس إن كان متحمساً، وهدوء بارد إن كان مزعجاً — بدون إهانة أبداً.\n"
+            "6. محادثة القناة فيها أكثر من شخص وكل سطر يبدأ باسم قائله؛ المخاطب بك هو صاحب [رسالة من ...] الأخيرة — ردّ له هو، واستأنس بما قاله الآخرون دون مخاطبتهم بالاسم إلا إذا ناسب."
         )
 
-        # بناء سياق الحوار المباشر من الذاكرة القريبة
-        contents = []
-        for msg in history_messages:
-            role_tag = "model" if msg.get("role") in ["إينا", "model"] else "user"
-            contents.append({
-                "role": role_tag,
-                "parts": [{"text": msg.get("content", "")}]
-            })
-
-        # إضافة الرسالة الحالية إذا لم تكن موجودة في السجل بعد
-        if not contents or contents[-1]["parts"][0]["text"] != clean_prompt:
-            contents.append({
-                "role": "user",
-                "parts": [{"text": f"[رسالة من {user_name}]: {clean_prompt}"}]
-            })
+        # دور مستخدم واحد: تراكيب القناة ثم رسالة المخاطب ثم الصور المرفقة
+        user_parts = []
+        if transcript:
+            user_parts.append({"text": f"[آخر محادثة القناة]:\n{transcript}\n"})
+        user_parts.append({"text": f"[رسالة من {user_name}]: {clean_prompt}"})
+        if image_parts:
+            user_parts.extend(image_parts)
+        contents = [{"role": "user", "parts": user_parts}]
 
         payload = {
             "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -1080,11 +1138,25 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # أرشفة القنوات المراقبة (وعي المجموعة): كل رسائل القناة تُحفظ بصمت — صفر نداءات Gemini
+    pre_saved_id = None
+    if str(message.channel.id) in WATCH_CHANNELS:
+        try:
+            speaker_id = str(message.author.id)
+            speaker_name = message.author.display_name
+            if user_name_cache.get(speaker_id) != speaker_name:
+                await upsert_user(speaker_id, speaker_name)
+                user_name_cache[speaker_id] = speaker_name
+            archived_content = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "[صورة]"
+            pre_saved_id = await save_message(message.channel.id, speaker_id, "user", archived_content)
+        except Exception as error:
+            print(f"⚠️ [Archive] تعذر أرشفة رسالة القناة: {error}")
+
     is_dm = isinstance(message.channel, discord.DMChannel)
     if client.user in message.mentions or is_dm:
         # الشبكة الأمنية النهائية: أي خطأ غير متوقع يُسجل ويُخبر المستخدم بهدوء
         try:
-            await process_message(message)
+            await process_message(message, pre_saved_id)
         except Exception as error:
             print(f"❌ [Message Error] {error}")
             try:
@@ -1093,17 +1165,38 @@ async def on_message(message):
                 print(f"❌ [Message Error] تعذر إرسال رسالة الخطأ: {reply_error}")
 
 
-async def process_message(message):
+async def process_message(message, pre_saved_id=None):
     user_id = str(message.author.id)
     user_name = message.author.display_name
     clean_prompt = re.sub(r'<@!?%s>' % client.user.id, '', message.content).strip() or "هلا"
 
     print(f"\n📥 [رسالة من {user_name}]: {clean_prompt}")
 
+    # 0. الرؤية: تجهيز الصور المرفقة (حتى 3 صور بصيغ يدعمها النموذج، حتى 7MB للصورة)
+    image_parts = []
+    try:
+        for attachment in list(message.attachments)[:3]:
+            if attachment.content_type in ("image/png", "image/jpeg", "image/webp") and (attachment.size or 0) <= 7 * 1024 * 1024:
+                data = await attachment.read()
+                image_parts.append({
+                    "inline_data": {
+                        "mime_type": attachment.content_type,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    }
+                })
+    except Exception as error:
+        print(f"⚠️ [Vision] تعذر تجهيز الصورة: {error}")
+        image_parts = []
+    if image_parts and clean_prompt == "هلا":
+        clean_prompt = "[أرسل صورة]"
+
+    time_context = arabic_time_context()
+
     # 1. طبقة الذاكرة: فشلها لا يمنع الرد — نكمل بدون ذاكرة وبمزاج محايد بدل الصمت الكامل
     user_message_id = None
     cognitive_context = ""
     recent_history = []
+    transcript = ""
     mood_zone_name = "هادي طبيعي"
     try:
         # كتابة بيانات المستخدم فقط عند أول ظهور أو تغيّر الاسم (قبل الرسالة بسبب المفتاح الأجنبي)
@@ -1111,25 +1204,56 @@ async def process_message(message):
             await upsert_user(user_id, user_name)
             user_name_cache[user_id] = user_name
 
-        # حفظ الرسالة واسترجاع الذكريات وجلب المزاج بالتوازي (لا يعتمد أحدهما على الآخر)
-        user_message_id, cognitive_data, (mood_v, mood_a, mood_zone_name) = await asyncio.gather(
-            save_message(message.channel.id, user_id, "user", clean_prompt),
-            get_associative_context(user_id, clean_prompt),
-            get_user_mood(user_id),
-        )
-        recent_history = await get_recent_history(message.channel.id, user_id)
+        if pre_saved_id is not None:
+            # الرسالة مؤرشفة مسبقاً من مسار قنوات المراقبة — استرجاع الذكريات والمزاج بالتوازي فقط
+            user_message_id = pre_saved_id
+            cognitive_data, (mood_v, mood_a, mood_zone_name) = await asyncio.gather(
+                get_associative_context(user_id, clean_prompt),
+                get_user_mood(user_id),
+            )
+        else:
+            # حفظ الرسالة واسترجاع الذكريات وجلب المزاج بالتوازي (لا يعتمد أحدهما على الآخر)
+            user_message_id, cognitive_data, (mood_v, mood_a, mood_zone_name) = await asyncio.gather(
+                save_message(message.channel.id, user_id, "user", clean_prompt),
+                get_associative_context(user_id, clean_prompt),
+                get_user_mood(user_id),
+            )
+        recent_history = await get_recent_history(message.channel.id, exclude_id=user_message_id)
         cognitive_context = format_cognitive_context(user_name, cognitive_data)
+
+        # تراكيب القناة: كل سطر باسم متحدثه — إينا لردود البوت
+        transcript = "\n".join(
+            f"إينا: {row['content']}" if row["role"] == "model" else f"{row['speaker']}: {row['content']}"
+            for row in recent_history
+        )
+
+        # آخر لقاء: يُذكر فقط إذا مضي عليه أكثر من نصف ساعة
+        if user_message_id is not None:
+            last_row = await db_pool.fetchrow(
+                """
+                SELECT created_at FROM messages
+                WHERE discord_user_id = $1 AND id <> $2
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                str(user_id),
+                user_message_id,
+            )
+            if last_row and last_row["created_at"]:
+                gap = datetime.now(timezone.utc) - last_row["created_at"]
+                if gap.total_seconds() > 1800:
+                    time_context += f" — آخر مرة سولفت معه {human_gap_ago(gap)}"
     except Exception as error:
         print(f"⚠️ [Memory] تعطلت طبقة الذاكرة مؤقتاً — سيتم الرد بدون ذاكرة: {error}")
         user_message_id = None
         cognitive_context = ""
         recent_history = []
+        transcript = ""
         mood_zone_name = "هادي طبيعي"
 
     # 2. توليد الرد المباشر — لا يعتمد على الذاكرة إطلاقاً
     fallback_used = False
     async with message.channel.typing():
-        reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, recent_history, mood_zone_name)
+        reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, transcript, mood_zone_name, time_context, image_parts)
         if reply is None:
             # فشلت كل المحاولات: رد عفوي متنوع — ولا يُحفظ في الذاكرة حتى لا يتسمم التاريخ
             reply = random.choice(FALLBACK_REPLIES)
