@@ -150,21 +150,49 @@ def sanitize_database_url(url):
     return url
 
 
-# كلمات شائعة للتجاهل عند استخراج الكلمات المفتاحية
-STOP_WORDS = {
+# تطبيع النص العربي: توحيد الحروف المتشابهة وحذف التشكيل والتطويل قبل أي مطابقة
+ARABIC_LETTER_MAP = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ئ": "ي", "ؤ": "و", "ة": "ه",
+})
+ARABIC_DIACRITICS_RE = re.compile(r"[\u064B-\u065F\u0670\u0640]")
+
+# سوابق التعريف والوصل التي تُحذف من بداية الكلمة قبل المقارنة
+ARTICLE_PREFIXES = ("وال", "فال", "بال", "كال", "لل", "ال")
+
+
+def normalize_arabic(text):
+    """يوحّد أشكال الحروف العربية ويحذف التشكيل والتطويل — فيتطابق "الجامعة" مع "بالجامعة"."""
+    if not text:
+        return ""
+    return ARABIC_DIACRITICS_RE.sub("", text.translate(ARABIC_LETTER_MAP))
+
+
+# كلمات شائعة للتجاهل عند استخراج الكلمات المفتاحية (تُطبَّع بنفس قواعد المطابقة)
+RAW_STOP_WORDS = {
     "انا", "أنا", "هو", "هي", "هم", "نحن", "انت", "أنت", "في", "من", "إلى", "على", "عن", "مع",
     "هذا", "هذه", "تم", "كان", "كنت", "ما", "لا", "لم", "لن", "هل", "وش", "ليه", "كيف", "وين",
     "اللي", "الي", "يلي", "شو", "بدك", "بس", "كل", "يا", "ان", "أن", "إن", "او", "أو", "ثم",
     "بعد", "قبل", "حتى", "إذا", "اذا", "عشان", "عشا", "لأنه", "لانه", "هيك", "كذا", "طيب"
 }
+STOP_WORDS = {normalize_arabic(word) for word in RAW_STOP_WORDS}
 
 
 def extract_keywords(text):
-    """يستخرج الكلمات الدلالية الهامة من الحديث للربط التلقائي بالذاكرة."""
+    """يستخرج الكلمات الدلالية الهامة بعد تطبيعها للربط التلقائي بالذاكرة."""
     if not text:
         return set()
-    words = re.findall(r"[\w\u0600-\u06FF]+", text.lower())
-    return {w for w in words if len(w) > 2 and w not in STOP_WORDS}
+    words = re.findall(r"[\w\u0600-\u06FF]+", normalize_arabic(text.lower()))
+    keywords = set()
+    for word in words:
+        for prefix in ARTICLE_PREFIXES:
+            # لا نحذف السابقة إلا إذا بقي جذع بطول 3 أحرف فأكثر حتى لا نُضيّع كلمات قصيرة
+            if word.startswith(prefix) and len(word) > len(prefix) + 2:
+                word = word[len(prefix):]
+                break
+        if len(word) > 2 and word not in STOP_WORDS:
+            keywords.add(word)
+    return keywords
 
 
 def human_time_ago(occurred_at):
@@ -422,6 +450,9 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS recall_count INT NOT NULL DEFAULT 
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_recalled_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS previous_value TEXT;
 
+-- ترقية المواقف بوسم الأجواء العاطفية (المرحلة الثانية من نظام المشاعر)
+ALTER TABLE episodes ADD COLUMN IF NOT EXISTS emotion TEXT;
+
 CREATE INDEX IF NOT EXISTS memories_user_updated_idx
     ON memories (discord_user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS memories_user_strength_idx
@@ -651,27 +682,42 @@ async def get_associative_context(user_id, current_prompt):
         # 2. استرجاع ذاكرة المواقف والسوالف السابقة (Episodic Memory)
         raw_episodes = await connection.fetch(
             """
-            SELECT id, summary, topics, importance, occurred_at
+            SELECT id, summary, topics, importance, emotion, occurred_at
             FROM episodes
             WHERE discord_user_id = $1
             ORDER BY occurred_at DESC
-            LIMIT 5
+            LIMIT 10
             """,
             str(user_id),
         )
 
+        # الأحدث دائماً (سياق المرة السابقة) ثم الأفضل من البقية: تطابق الموضوع ثم الأهمية
         selected_episodes = []
-        for ep in raw_episodes:
-            ep_topics = set(ep["topics"] or [])
-            # جلب آخر موقف حدث دائماً (لسياق المرة السابقة) أو المواقف المرتبطة بالسالفة الحالية
-            if not selected_episodes or bool(prompt_keywords & ep_topics):
+        if raw_episodes:
+            first = raw_episodes[0]
+            selected_episodes.append({
+                "summary": first["summary"],
+                "time_ago": human_time_ago(first["occurred_at"]),
+                "importance": first["importance"],
+                "emotion": first["emotion"],
+            })
+            rest = sorted(
+                raw_episodes[1:],
+                key=lambda ep: (
+                    1 if prompt_keywords & extract_keywords(" ".join(ep["topics"] or [])) else 0,
+                    ep["importance"],
+                ),
+                reverse=True,
+            )
+            for ep in rest:
+                if len(selected_episodes) >= 2:
+                    break
                 selected_episodes.append({
                     "summary": ep["summary"],
                     "time_ago": human_time_ago(ep["occurred_at"]),
                     "importance": ep["importance"],
+                    "emotion": ep["emotion"],
                 })
-                if len(selected_episodes) >= 2:
-                    break
 
         return {
             "memories": selected_memories,
@@ -686,9 +732,12 @@ def format_cognitive_context(user_name, cognitive_data):
 
     sections = []
 
-    # 1. المواقف السابقة
+    # 1. المواقف السابقة — مع وسم الأجواء العاطفية إن وُجد
     if episodes:
-        ep_lines = [f"- {ep['time_ago']}: {ep['summary']}" for ep in episodes]
+        ep_lines = []
+        for ep in episodes:
+            tag = f" (الأجواء: {ep['emotion']})" if ep.get("emotion") else ""
+            ep_lines.append(f"- {ep['time_ago']}{tag}: {ep['summary']}")
         sections.append(f"[مواقف وأحداث مشتركة سابقة بينكما]:\n" + "\n".join(ep_lines))
 
     # 2. الحقائق الحاضرة في الذهن وتنبيهات التغير والتناقض
@@ -964,7 +1013,8 @@ valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal
             if emotion_task is not None:
                 emo_result = results[idx]
 
-            # 3. دفع المشاعر إلى مزاج إينا (فشلها آمن ولا يمس الذاكرة)
+            # 3. دفع المشاعر إلى مزاج إينا (فشلها آمن ولا يمس الذاكرة) — وتُحفظ لوسم الموقف
+            emotion_data = None
             if emo_result:
                 emotion_data = valid_emotion(parse_json_safely(emo_result))
                 if emotion_data:
@@ -981,13 +1031,15 @@ valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal
             if saved_count:
                 print(f"🧠 [Memory] تم تثبيت/تحديث {saved_count} حقيقة للمستخدم {user_name}.")
 
-            # معالجة نتيجة الموقف (إن كان قد طُلب)
+            # معالجة نتيجة الموقف (إن كان قد طُلب) — مع وسم الأجواء إن وُجد شعور مكتشف
             if ep_result is not None:
                 ep_data = parse_json_safely(ep_result)
                 if ep_data.get("has_episode") and ep_data.get("summary"):
                     summary = ep_data["summary"].strip()
-                    topics = [str(t).strip().lower() for t in ep_data.get("topics", []) if str(t).strip()]
+                    raw_topics = " ".join(str(t) for t in ep_data.get("topics", []) if str(t).strip())
+                    topics = sorted(extract_keywords(raw_topics))
                     importance = max(1, min(int(ep_data.get("importance", 5)), 10))
+                    episode_emotion = emotion_data["emotion"] if emotion_data else None
 
                     async with db_pool.acquire() as connection:
                         # منع تكرار نفس ملخص الموقف إذا كان مسجلاً مؤخراً
@@ -1002,12 +1054,14 @@ valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal
                         if not duplicate:
                             await connection.execute(
                                 """
-                                INSERT INTO episodes (discord_user_id, summary, topics, importance, occurred_at)
-                                VALUES ($1, $2, $3, $4, NOW())
+                                INSERT INTO episodes (discord_user_id, summary, topics, importance, emotion, occurred_at)
+                                VALUES ($1, $2, $3, $4, $5, NOW())
                                 """,
                                 str(user_id),
                                 summary,
                                 topics,
+                                importance,
+                                episode_emotion,
                                 importance,
                             )
                             print(f"📖 [Episode] تم تسجيل موقف جديد في الذاكرة لـ {user_name}: {summary}")
