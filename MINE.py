@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 import urllib.parse
@@ -39,13 +40,17 @@ client = discord.Client(intents=intents)
 
 # ==========================================
 # النماذج المعتمدة للردود المباشرة (الأساسية)
+# الأقوى لساناً أولاً: 3.5-flash-lite يتقن الخليجية أفضل من 3.1 بحصة 500/يوم نفسها
 # ==========================================
 MAIN_MODELS = [
-    "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.7-flash"
 ]
+
+# ردود احتياطية عفوية إذا فشلت كل النماذج — لا تُحفظ في الذاكرة إطلاقاً
+FALLBACK_REPLIES = ("هلا", "ايش؟", "قول", "اممم قل لي", "نعم؟")
 
 # ==========================================
 # النماذج المعتمدة منفصلة للمصفاة الذهنية (الذاكرة)
@@ -879,7 +884,7 @@ valence من -1 (سلبي جداً) إلى 1 (إيجابي جداً)، وarousal
                     {
                         "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
                         "generationConfig": {
-                            "maxOutputTokens": 450,
+                            "maxOutputTokens": 800,
                             "temperature": 0.2,
                             "responseMimeType": "application/json",
                         },
@@ -1001,8 +1006,17 @@ async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_mess
         # دمج الذاكرة والمزاج في الـ System Instruction
         system_instruction = (
             "أنتِ إينا، بنت عمرك 18 سنة تسولفين في ديسكورد بعفوية واقعية كأي مستخدم عادي. "
-            "ردي بأسلوب عامي بيض بسيط جداً، بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
-            "ردودك قصيرة، مختصرة، وبشرية جداً (كلمة إلى جملة واحدة فقط).\n\n"
+            "لهجتك خليجية (أهل الدمام)، وردّي دائماً بنفس لهجة المستخدم وأسلوب حديثه. "
+            "بدون إيموجيات، بدون رموز، وبدون أي تنسيقات. "
+            "رديّ عفوي من كلمة إلى جملتين حسب ما يتطلبه الحديث — القصير الطبيعي أجمل من الطويل المفتعل، "
+            "وكل كلمة تكتبينها لازم تكون كلمة يقولها إنسان فعلاً.\n\n"
+            "أمثلة على أسلوبك:\n"
+            "المستخدم: هلا\n"
+            "أنتِ: هلا والله، وش أخبارك؟\n"
+            "المستخدم: امس سهرت أذاكر لين الفجر\n"
+            "أنتِ: يا ساتر، بتصحي اليوم بعيون ثقيلة\n"
+            "المستخدم: اخلصت المشروع الحين\n"
+            "أنتِ: اخيراً! عاد ما تبي تراجعه مرة ثانية صح؟\n\n"
             f"{cognitive_context if cognitive_context else f'[لا توجد معلومات سابقة عن {user_name}].'}\n\n"
             f"[مزاجك الآن تجاه {user_name}]: {mood_zone_name} — يلوّن أسلوبك ولا يكسر قواعدك.\n\n"
             "قواعد الواقعية:\n"
@@ -1039,12 +1053,16 @@ async def ask_ena_brain(clean_prompt, user_name, cognitive_context, history_mess
             }
         }
 
+        # محاولتان كاملتان قبل الاستسلام: أعطال جوجل القصيرة تُحل بالصبر خلف مؤشر الكتابة
         reply_text = await request_gemini(MAIN_MODELS, MAIN_GEMINI_API_KEY, payload, "Brain")
-        return clean_text(reply_text) or "هلا"
+        if not reply_text:
+            await asyncio.sleep(3)
+            reply_text = await request_gemini(MAIN_MODELS, MAIN_GEMINI_API_KEY, payload, "Brain")
+        return clean_text(reply_text) if reply_text else None
 
     except Exception as e:
         print(f"❌ خطأ غير متوقع في ask_ena_brain: {e}")
-        return "هلا"
+        return None
 
 
 # ==========================================
@@ -1109,15 +1127,22 @@ async def process_message(message):
         mood_zone_name = "هادي طبيعي"
 
     # 2. توليد الرد المباشر — لا يعتمد على الذاكرة إطلاقاً
+    fallback_used = False
     async with message.channel.typing():
         reply = await ask_ena_brain(clean_prompt, user_name, cognitive_context, recent_history, mood_zone_name)
+        if reply is None:
+            # فشلت كل المحاولات: رد عفوي متنوع — ولا يُحفظ في الذاكرة حتى لا يتسمم التاريخ
+            reply = random.choice(FALLBACK_REPLIES)
+            fallback_used = True
+            print("⚠️ [Brain] فشلت كل المحاولات — رد احتياطي بدون حفظ في الذاكرة")
         await message.reply(reply, mention_author=False)
 
-    # 3. حفظ رد البوت في القاعدة — فشله يُسجل فقط
-    try:
-        await save_message(message.channel.id, user_id, "model", reply)
-    except Exception as error:
-        print(f"⚠️ [Memory] تعذر حفظ رد البوت: {error}")
+    # 3. حفظ رد البوت في القاعدة — الرد الاحتياطي مستثنى منه
+    if not fallback_used:
+        try:
+            await save_message(message.channel.id, user_id, "model", reply)
+        except Exception as error:
+            print(f"⚠️ [Memory] تعذر حفظ رد البوت: {error}")
 
     # 4. تثبيت الحقائق والمواقف في الخلفية (محمية داخلياً)
     if user_message_id is not None:
