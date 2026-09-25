@@ -81,6 +81,11 @@ MOOD_BASELINE_A = 0.2      # طاقة الأساس: هادئ
 MOOD_EMA_ALPHA = 0.25      # وزن إشارة الرسالة الجديدة في المتوسط المتحرك
 MOOD_DECAY_PER_HOUR = 0.5  # نصف قوة المزاج تتبخر كل ساعة سكون
 
+# ثوابت نظافة الذاكرة (تنظيف دوري يعمل مرة كل إقلاع)
+MESSAGE_RETENTION_DAYS = 90  # عمر الحوار الخام قبل حذفه — خلاصته عاشت أصلاً كحقائق ومواقف
+DEAD_MEMORY_DAYS = 90        # مدة عدم الاستدعاء التي تُعتبر بعدها الذكرى ميتة
+DEAD_MEMORY_STRENGTH = 1.5   # الحد الأعلى لقوة الذكرى الميتة (أُنشئت ولم تُكرر قط)
+
 HISTORY_LIMIT = 12
 
 # قنوات المراقبة (وعي المجموعة): معرفات قنوات مفصولة بفواصل من متغير البيئة WATCH_CHANNELS
@@ -512,6 +517,37 @@ END $$;
 """
 
 
+async def cleanup_old_data(connection):
+    """نظافة دورية تعمل مرة كل إقلاع: حوار خام قديم وذكريات ميتة.
+    المواقف لا تُمس أبداً — الذكرى المشتركة هي كنز النظام."""
+    try:
+        old_messages = await connection.fetchval(
+            f"""
+            WITH deleted AS (
+                DELETE FROM messages
+                WHERE created_at < NOW() - INTERVAL '{MESSAGE_RETENTION_DAYS} days'
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            """
+        )
+        dead_memories = await connection.fetchval(
+            f"""
+            WITH deleted AS (
+                DELETE FROM memories
+                WHERE last_recalled_at < NOW() - INTERVAL '{DEAD_MEMORY_DAYS} days'
+                  AND strength <= {DEAD_MEMORY_STRENGTH}
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            """
+        )
+        if old_messages or dead_memories:
+            print(f"🧹 [Cleanup] تنظيف الإقلاع: {old_messages or 0} رسالة قديمة، {dead_memories or 0} ذكرى ميتة.", flush=True)
+    except Exception as error:
+        print(f"⚠️ [Cleanup] فشل التنظيف الدوري (غير مؤثر على التشغيل): {error}", flush=True)
+
+
 async def initialize_database():
     """يفتح اتصالاً بـ Supabase Postgres وينشئ أو يرقّي الجداول والفهارس."""
     global db_pool
@@ -546,6 +582,7 @@ async def initialize_database():
             async with db_pool.acquire() as connection:
                 await connection.execute("SELECT 1")
                 await connection.execute(SCHEMA_SQL)
+                await cleanup_old_data(connection)
             print("✅ [Postgres] تم تجهيز جداول الذاكرة البشرية (الحقائق، المواقف، الرسوخ) وحمايتها بـ RLS.", flush=True)
             return
         except Exception as error:
@@ -900,10 +937,32 @@ async def update_memory_in_background(user_id, user_name, recent_history, source
             )
 
             # 1. استخراج حقائق الذاكرة الدائمة — للمخاطب فقط، وكلام الآخرين سياق لا ملف
+            # الطبقة 1 من نظافة الذاكرة: الاستخراج يرى الحقائق الحالية فيصير التصحيح على نفس المفتاح حتمياً
+            current_facts_rows = await db_pool.fetch(
+                """
+                SELECT memory_key, memory_value
+                FROM memories
+                WHERE discord_user_id = $1
+                ORDER BY (confidence * (strength / (1.0 + 0.04 * GREATEST(0, EXTRACT(EPOCH FROM (NOW() - last_recalled_at)) / 86400.0)))) DESC
+                LIMIT 30
+                """,
+                str(user_id),
+            )
+            current_facts = "\n".join(
+                f"- {row['memory_key']}: {row['memory_value']}" for row in current_facts_rows
+            ) or "لا توجد حقائق مسجلة بعد."
+
             fact_prompt = f"""
 أنت جزء الذاكرة المعرفية في بوت Discord. استخرج فقط الحقائق الثابتة والمفيدة عن المستخدم: {user_name} (صاحب آخر رسالة موجهة للبوت).
 قد يشارك في حوار القناة أشخاص آخرون — كلامهم سياق فقط: لا تخزن حقائق عنهم مهما كانت.
-لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح لمعلومة قديمة، أعد قائمة فارغة.
+
+الحقائق المسجلة حالياً عنه:
+{current_facts}
+
+قواعد التصحيح والاستبدال:
+- عند تصحيح أو تغيير معلومة مسجلة: أعد نفس المفتاح الموجود بالضبط مع القيمة الجديدة — لا تخترع مفتاحاً جديداً.
+- لا تعيد استخراج ما هو مسجل أصلاً — فقط الجديد أو المصحح.
+- لا تخزن التحية أو الأسئلة العابرة. إذا لم توجد حقيقة جديدة أو تصحيح، أعد قائمة فارغة.
 
 أعد JSON صالحاً فقط:
 {{"memories":[{{"key":"english_snake_case","value":"حقيقة قصيرة بالعربية","category":"profile_or_preference_or_interest","confidence":0.85}}]}}
