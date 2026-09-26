@@ -22,6 +22,14 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 MAIN_GEMINI_API_KEY = (os.getenv('MAIN_GEMINI_API_KEY') or os.getenv('GEMINI_API_KEY') or "").strip()
 MEMORY_GEMINI_API_KEY = (os.getenv('MEMORY_GEMINI_API_KEY') or MAIN_GEMINI_API_KEY).strip()
 
+# مفاتيح الذاكرة المتعددة: افصلها بفواصل في MEMORY_GEMINI_API_KEYS —
+# التناوب التلقائي يجعل نفاد حصة أحدها شفافاً تماماً (يُرصد من 429 ويُدار)
+memory_api_keys = [
+    k.strip()
+    for k in (os.getenv("MEMORY_GEMINI_API_KEYS", "") or MEMORY_GEMINI_API_KEY).split(",")
+    if k.strip()
+]
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATABASE_SSL_ENV = os.getenv("DATABASE_SSL", "").strip().lower()
 DATABASE_SSL = DATABASE_SSL_ENV in {"1", "true", "yes"} or "supabase" in DATABASE_URL
@@ -309,6 +317,14 @@ def is_key_quota_exhausted(api_key):
     """هل حصة هذا المفتاح انتهت ولم تجدد بعد؟ يقرأ الواقع (أول 429) لا يفترضه."""
     until = quota_exhausted_until.get(api_key)
     return bool(until and datetime.now(timezone.utc) < until)
+
+
+def pick_memory_key():
+    """يختار أول مفتاح ذاكرة لم تنفد حصته — نفاد أحدها يُرصد من 429 فيصير التناوب شفافاً."""
+    for key in memory_api_keys:
+        if not is_key_quota_exhausted(key):
+            return key
+    return memory_api_keys[0]
 
 
 # ==========================================
@@ -1076,7 +1092,7 @@ def parse_json_safely(text):
 # ==========================================
 async def update_memory_in_background(user_id, user_name, channel_id, recent_history, source_message_id):
     """مهمة خلفية: تستخرج الحقائق الراسخة وتلخص المواقف والأحداث المشتركة (Episodic)."""
-    if db_pool is None or not MEMORY_GEMINI_API_KEY:
+    if db_pool is None or not memory_api_keys:
         return
 
     async with memory_locks[str(user_id)]:
@@ -1149,7 +1165,7 @@ async def update_memory_in_background(user_id, user_name, channel_id, recent_his
 """
             fact_task = request_gemini(
                 MEMORY_MODELS,
-                MEMORY_GEMINI_API_KEY,
+                pick_memory_key(),
                 {
                     "contents": [{"role": "user", "parts": [{"text": fact_prompt}]}],
                     "generationConfig": {
@@ -1185,7 +1201,7 @@ async def update_memory_in_background(user_id, user_name, channel_id, recent_his
 """
                 episode_task = request_gemini(
                     EPISODE_MODELS,
-                    MEMORY_GEMINI_API_KEY,
+                    pick_memory_key(),
                     {
                         "contents": [{"role": "user", "parts": [{"text": episode_prompt}]}],
                         "generationConfig": {
