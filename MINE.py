@@ -1742,6 +1742,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # الخاص معطل بقرار المالك: إينا تسولف في قنوات السيرفر فقط — رسائل الخاص تُتجاهل صمتاً
+    if isinstance(message.channel, discord.DMChannel):
+        return
+
+
     # أرشفة القنوات المراقبة (وعي المجموعة): كل رسائل القناة تُحفظ بصمت — صفر نداءات Gemini
     pre_saved_id = None
     if str(message.channel.id) in WATCH_CHANNELS:
@@ -1756,8 +1761,7 @@ async def on_message(message):
         except Exception as error:
             print(f"⚠️ [Archive] تعذر أرشفة رسالة القناة: {error}")
 
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    if client.user in message.mentions or is_dm:
+    if client.user in message.mentions:
         # الشبكة الأمنية النهائية: أي خطأ غير متوقع يُسجل ويُخبر المستخدم بهدوء
         try:
             await process_message(message, pre_saved_id)
