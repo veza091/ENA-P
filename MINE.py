@@ -607,25 +607,28 @@ async def cleanup_old_data(connection):
     المواقف لا تُمس أبداً — الذكرى المشتركة هي كنز النظام."""
     try:
         old_messages = await connection.fetchval(
-            f"""
+            """
             WITH deleted AS (
                 DELETE FROM messages
-                WHERE created_at < NOW() - INTERVAL '{MESSAGE_RETENTION_DAYS} days'
+                WHERE created_at < NOW() - make_interval(days => $1)
                 RETURNING 1
             )
             SELECT COUNT(*) FROM deleted
-            """
+            """,
+            MESSAGE_RETENTION_DAYS,
         )
         dead_memories = await connection.fetchval(
-            f"""
+            """
             WITH deleted AS (
                 DELETE FROM memories
-                WHERE last_recalled_at < NOW() - INTERVAL '{DEAD_MEMORY_DAYS} days'
-                  AND strength <= {DEAD_MEMORY_STRENGTH}
+                WHERE last_recalled_at < NOW() - make_interval(days => $1)
+                  AND strength <= $2
                 RETURNING 1
             )
             SELECT COUNT(*) FROM deleted
-            """
+            """,
+            DEAD_MEMORY_DAYS,
+            DEAD_MEMORY_STRENGTH,
         )
         # التوقعات: غير المُتابعة تموت بعد 60 يوماً، والمُتابعة تُحذف بعد 30 يوماً من خدمتها
         stale_anticipations = await connection.fetchval(
@@ -1316,9 +1319,15 @@ async def request_gemini(models, api_key, payload, label):
     tried = 0
     quota_only = True  # يظل صحيحاً ما دامت كل الرفوض 429 (نفاد حصة) لا أعطالاً أخرى
     for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        # المفتاح في الهيدر لا في الرابط: الروابط تسرب إلى السجلات عند أي استثناء شبكة
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            async with session.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15) as resp:
+            async with session.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                timeout=15,
+            ) as resp:
                 tried += 1
                 if resp.status == 200:
                     data = await resp.json()
@@ -1582,7 +1591,7 @@ async def proactive_tick():
 
         # المشغل أ: متابعة شخصية — من تعرفه، ضمن نافذة الغياب، ولم تبادر له مؤخراً
         candidates = await connection.fetch(
-            f"""
+            """
             WITH last_activity AS (
                 SELECT discord_user_id, MAX(created_at) AS last_at
                 FROM messages
@@ -1604,11 +1613,14 @@ async def proactive_tick():
             JOIN users u ON u.discord_user_id = la.discord_user_id
             LEFT JOIN last_proactive lp ON lp.discord_user_id = la.discord_user_id
             WHERE EXISTS (SELECT 1 FROM memories mem WHERE mem.discord_user_id = la.discord_user_id)
-              AND la.last_at > NOW() - INTERVAL '{PROACTIVE_MAX_AGE_DAYS} days'
-              AND la.last_at < NOW() - INTERVAL '{PROACTIVE_MIN_GAP_MINUTES} minutes'
-              AND (lp.last_sent IS NULL OR lp.last_sent < NOW() - INTERVAL '{PROACTIVE_USER_GAP_HOURS} hours')
+              AND la.last_at > NOW() - make_interval(days => $1)
+              AND la.last_at < NOW() - make_interval(mins => $2)
+              AND (lp.last_sent IS NULL OR lp.last_sent < NOW() - make_interval(hours => $3))
             ORDER BY la.last_at ASC
-            """
+            """,
+            PROACTIVE_MAX_AGE_DAYS,
+            PROACTIVE_MIN_GAP_MINUTES,
+            PROACTIVE_USER_GAP_HOURS,
         )
         eligible = [row for row in candidates if row["last_channel"] in WATCH_CHANNELS]
         if eligible:
@@ -1650,12 +1662,13 @@ async def proactive_tick():
             if channel is None:
                 continue
             recent_count = await connection.fetchval(
-                f"""
+                """
                 SELECT COUNT(*) FROM messages
                 WHERE channel_id = $1 AND role = 'user'
-                  AND created_at > NOW() - INTERVAL '{GROUP_WINDOW_MINUTES} minutes'
+                  AND created_at > NOW() - make_interval(mins => $2)
                 """,
                 str(channel_id),
+                GROUP_WINDOW_MINUTES,
             )
             if recent_count < GROUP_MIN_MESSAGES:
                 continue
