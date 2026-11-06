@@ -171,3 +171,7 @@ Issues and pull requests are welcome, especially for tests, documentation and sp
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Security
+
+This project is scanned with [Snyk](https://snyk.io/).
